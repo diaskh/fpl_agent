@@ -1,0 +1,26 @@
+[Unit]
+Description=Elimai League FPL Telegram reporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=fplbot
+Group=fplbot
+WorkingDirectory=/opt/fpl-bot
+EnvironmentFile=/opt/fpl-bot/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=DATABASE_PATH=/var/lib/fpl-bot/fpl_data.db
+ExecStart=/opt/fpl-bot/.venv/bin/python /opt/fpl-bot/bot.py run
+Restart=always
+RestartSec=10
+TimeoutStopSec=90
+StateDirectory=fpl-bot
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS managers (entry_id INTEGER PRIMARY KEY, entry_name TEXT NOT NULL, player_name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS phases (id INTEGER PRIMARY KEY, name TEXT NOT NULL, start_event INTEGER NOT NULL, stop_event INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS gameweeks (id INTEGER PRIMARY KEY, name TEXT NOT NULL, finished INTEGER NOT NULL, data_checked INTEGER NOT NULL, phase_id INTEGER REFERENCES phases(id));
+CREATE TABLE IF NOT EXISTS players (id INTEGER PRIMARY KEY, web_name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS standings (
+ entry_id INTEGER REFERENCES managers(entry_id), gw_id INTEGER REFERENCES gameweeks(id),
+ rank INTEGER NOT NULL, last_rank INTEGER, total_points INTEGER NOT NULL, event_points INTEGER NOT NULL,
+ PRIMARY KEY(entry_id,gw_id));
+CREATE TABLE IF NOT EXISTS picks (
+ entry_id INTEGER REFERENCES managers(entry_id), gw_id INTEGER REFERENCES gameweeks(id),
+ element_id INTEGER REFERENCES players(id), position INTEGER CHECK(position BETWEEN 1 AND 15),
+ is_captain INTEGER NOT NULL, multiplier INTEGER NOT NULL, PRIMARY KEY(entry_id,gw_id,element_id));
+CREATE TABLE IF NOT EXISTS autosubs (
+ entry_id INTEGER REFERENCES managers(entry_id), gw_id INTEGER REFERENCES gameweeks(id),
+ element_in INTEGER NOT NULL, element_out INTEGER NOT NULL,
+ PRIMARY KEY(entry_id,gw_id,element_in,element_out));
+CREATE TABLE IF NOT EXISTS live_points (element_id INTEGER REFERENCES players(id), gw_id INTEGER REFERENCES gameweeks(id), points INTEGER NOT NULL, PRIMARY KEY(element_id,gw_id));
+CREATE TABLE IF NOT EXISTS sync_runs (gw_id INTEGER PRIMARY KEY, synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS reports (
+ gw_id INTEGER PRIMARY KEY, messages TEXT NOT NULL, sent_count INTEGER NOT NULL DEFAULT 0 CHECK(sent_count BETWEEN 0 AND 2),
+ completed_at TEXT);
+CREATE INDEX IF NOT EXISTS standings_gw ON standings(gw_id);
+CREATE INDEX IF NOT EXISTS picks_gw ON picks(gw_id);
+
+-- Bootstrap entity columns are added transactionally from the API by bootstrap.py.
+CREATE TABLE IF NOT EXISTS teams (id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS chips (id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS player_positions (id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS stat_definitions (name TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS game_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS game_config (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bootstrap_extra (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bootstrap_summary (id INTEGER PRIMARY KEY CHECK(id=1), total_players INTEGER NOT NULL, fetched_at TEXT NOT NULL);
+
+CREATE TABLE IF NOT EXISTS result_status (gw_id INTEGER PRIMARY KEY, provisional INTEGER NOT NULL CHECK(provisional IN (0,1)));
