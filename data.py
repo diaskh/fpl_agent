@@ -71,6 +71,17 @@ def latest_available(bootstrap):
                 (e.get("is_current") and datetime.fromisoformat(e["deadline_time"].replace("Z", "+00:00")) <= now)), default=None)
 
 
+def completed_fixture_groups(fixtures):
+    """Return kickoff timestamps whose entire simultaneous fixture group is finished."""
+    groups = {}
+    for fixture in fixtures:
+        kickoff = fixture.get("kickoff_time")
+        if kickoff:
+            groups.setdefault(kickoff, []).append(fixture)
+    return [kickoff for kickoff, games in sorted(groups.items())
+            if games and all(game.get("finished") is True for game in games)]
+
+
 def month_phase(phases, gw):
     # Overall (id=1) overlaps every monthly phase; never select it as a month.
     matches = [p for p in phases if p["id"] != 1 and p["start_event"] <= gw <= p["stop_event"]]
@@ -102,6 +113,40 @@ class Store:
 
     async def sync_bootstrap(self, bootstrap):
         await save_bootstrap(self.db, bootstrap, self.league_id)
+
+    async def sync_fixtures(self, fixtures):
+        """Replace the fixture snapshot used by /ask with validated official data."""
+        fields = ('id', 'event', 'kickoff_time', 'team_h', 'team_a', 'team_h_score',
+                  'team_a_score', 'started', 'finished', 'finished_provisional', 'minutes')
+        if not isinstance(fixtures, list):
+            raise ValueError('Fixtures must be a list')
+        ids = []
+        values = []
+        for fixture in fixtures:
+            if not isinstance(fixture, dict) or type(fixture.get('id')) is not int:
+                raise ValueError('Invalid fixture')
+            if type(fixture.get('team_h')) is not int or type(fixture.get('team_a')) is not int:
+                raise ValueError('Invalid fixture teams')
+            ids.append(fixture['id'])
+            values.append(tuple(int(fixture.get(field, False)) if field in
+                                ('started', 'finished', 'finished_provisional') else
+                                (fixture.get(field, 0) if field == 'minutes' else fixture.get(field))
+                                for field in fields))
+        if len(ids) != len(set(ids)):
+            raise ValueError('Duplicate fixture IDs')
+        try:
+            await self.db.execute('BEGIN')
+            await self.db.execute('DELETE FROM fixtures')
+            await self.db.executemany(
+                'INSERT INTO fixtures(id,event,kickoff_time,team_h,team_a,team_h_score,'
+                'team_a_score,started,finished,finished_provisional,minutes) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?)', values)
+            await self.db.execute("INSERT INTO metadata(key,value) VALUES ('fixtures_synced_at',CURRENT_TIMESTAMP) "
+                                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+            await self.db.commit()
+        except BaseException:
+            await self.db.rollback()
+            raise
 
     async def prepare(self, bootstrap):
         await self.sync_bootstrap(bootstrap)

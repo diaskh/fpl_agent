@@ -22,6 +22,10 @@ CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS reports (
  gw_id INTEGER PRIMARY KEY, messages TEXT NOT NULL, sent_count INTEGER NOT NULL DEFAULT 0 CHECK(sent_count BETWEEN 0 AND 2),
  completed_at TEXT);
+CREATE TABLE IF NOT EXISTS fixture_reports (
+ gw_id INTEGER NOT NULL REFERENCES gameweeks(id), kickoff_time TEXT NOT NULL,
+ messages TEXT NOT NULL, sent_count INTEGER NOT NULL DEFAULT 0 CHECK(sent_count BETWEEN 0 AND 2),
+ completed_at TEXT, PRIMARY KEY(gw_id,kickoff_time));
 CREATE INDEX IF NOT EXISTS standings_gw ON standings(gw_id);
 CREATE INDEX IF NOT EXISTS picks_gw ON picks(gw_id);
 
@@ -36,3 +40,12 @@ CREATE TABLE IF NOT EXISTS bootstrap_extra (key TEXT PRIMARY KEY, value TEXT NOT
 CREATE TABLE IF NOT EXISTS bootstrap_summary (id INTEGER PRIMARY KEY CHECK(id=1), total_players INTEGER NOT NULL, fetched_at TEXT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS result_status (gw_id INTEGER PRIMARY KEY, provisional INTEGER NOT NULL CHECK(provisional IN (0,1)));
+
+-- Latest official Premier League fixture state. Scores are nullable before kickoff.
+CREATE TABLE IF NOT EXISTS fixtures (
+ id INTEGER PRIMARY KEY, event INTEGER REFERENCES gameweeks(id), kickoff_time TEXT,
+ team_h INTEGER NOT NULL REFERENCES teams(id), team_a INTEGER NOT NULL REFERENCES teams(id),
+ team_h_score INTEGER, team_a_score INTEGER, started INTEGER NOT NULL,
+ finished INTEGER NOT NULL, finished_provisional INTEGER NOT NULL, minutes INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fixtures_event ON fixtures(event);

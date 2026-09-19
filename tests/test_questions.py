@@ -8,9 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, patch
 
-from bot import Config, Service, ask_command, question_message
+from bot import Config, Service, ask_command, question_message, split_answer
 from data import connect
-from questions import answer, snapshot, query, FAILURE
+from questions import answer, name_candidates, normalized_name, snapshot, query, FAILURE
 
 
 def response(value):
@@ -22,11 +22,16 @@ class QuestionTests(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.db = await connect(str(Path(self.temp.name) / 'test.db'))
         await self.db.executescript("""
-INSERT INTO managers VALUES (1,'Team One','Alice'),(2,'Team Two','Bob');
+INSERT INTO managers VALUES (1,'Team One','Alice'),(2,'Team Two','Bob'),(3,'riko','Rinat Sagitov');
+INSERT INTO players VALUES (411,'Haaland');
 INSERT INTO gameweeks VALUES (1,'GW1',1,1,NULL),(2,'GW2',1,1,NULL);
 INSERT INTO standings VALUES (1,1,1,NULL,60,60),(2,1,2,NULL,40,40),(1,2,1,1,999,939);
 INSERT INTO sync_runs(gw_id) VALUES (1);
 INSERT INTO metadata VALUES ('secret','private');
+ALTER TABLE teams ADD COLUMN name;
+ALTER TABLE teams ADD COLUMN bootstrap_current;
+INSERT INTO teams(id,name,bootstrap_current) VALUES (5,'Brighton',1),(9,'Liverpool',1);
+INSERT INTO fixtures VALUES (44,2,'2026-08-02T14:00:00Z',5,9,2,1,1,1,0,90);
 """)
         self.create = AsyncMock()
         llm = NS(chat=NS(completions=NS(create=self.create)))
@@ -48,6 +53,38 @@ INSERT INTO metadata VALUES ('secret','private');
         self.assertIn('60', payload)
         self.assertNotIn('999', payload)
         self.assertNotIn('private', str(self.create.call_args_list))
+
+    async def test_finished_fixture_is_available_independently_of_gameweek_status(self):
+        await self.db.execute('UPDATE gameweeks SET finished=0,data_checked=0 WHERE id=2')
+        await self.db.commit()
+        self.create.side_effect = [
+            response({'action':'query','sql':'''SELECT f.event,home.name AS home,away.name AS away,
+                     f.team_h_score,f.team_a_score,f.finished FROM fixtures f
+                     JOIN teams home ON home.id=f.team_h JOIN teams away ON away.id=f.team_a
+                     WHERE f.event=2 AND (home.name='Brighton' OR away.name='Brighton')'''}),
+            response({'action':'answer','basis':'database','text':'Brighton победил Liverpool 2:1; матч завершён.'})]
+        result = await answer(self.service, 'Расскажи про матч Brighton во втором туре')
+        self.assertIn('2:1', result)
+        payload = self.create.call_args.kwargs['messages'][-1]['content']
+        self.assertIn('"finished": 1', payload)
+
+    async def test_cyrillic_and_fuzzy_name_resolution(self):
+        db, _, _ = await snapshot(self.service)
+        try:
+            self.assertEqual(normalized_name('Холанд'), 'holand')
+            player = name_candidates(db, 'Сколько очков у Холанда?')[0]
+            self.assertEqual((player['entity'], player['id'], player['name']), ('footballer', 411, 'Haaland'))
+            manager = name_candidates(db, 'Покажи очки Рината Сагитова')[0]
+            self.assertEqual((manager['entity'], manager['id']), ('manager', 3))
+        finally:
+            db.close()
+
+    async def test_resolved_candidates_are_supplied_to_model(self):
+        self.create.return_value = response({'action':'answer', 'basis':'general', 'text':'ok'})
+        await answer(self.service, 'Как сыграл Холанд?')
+        prompt = self.create.call_args.kwargs['messages'][0]['content']
+        self.assertIn('Resolved name candidates', prompt)
+        self.assertIn('Haaland', prompt)
 
     async def test_general_question_answered_without_query(self):
         self.create.return_value = response({'action':'answer', 'basis':'general', 'text':'Mix flour, eggs and milk to make pancake batter.'})
@@ -72,7 +109,7 @@ INSERT INTO metadata VALUES ('secret','private');
         finally:
             db.close()
         async with self.db.execute('SELECT COUNT(*) FROM managers') as cursor:
-            self.assertEqual((await cursor.fetchone())[0], 2)
+            self.assertEqual((await cursor.fetchone())[0], 3)
 
     async def test_oversize_result_rejected(self):
         db, _, _ = await snapshot(self.service)
@@ -93,6 +130,20 @@ INSERT INTO metadata VALUES ('secret','private');
             await ask_command(self.update, self.context)
             self.assertEqual(mocked.await_count, 1)
             self.assertIn('10 секунд', self.message.reply_text.call_args.args[0])
+
+    async def test_ask_sends_one_to_three_messages_according_to_length(self):
+        self.assertEqual(split_answer('short'), ['short'])
+        long_answer = ('Первый абзац. ' * 350) + '\n\n' + ('Второй абзац. ' * 350)
+        parts = split_answer(long_answer)
+        self.assertEqual(len(parts), 3)
+        self.assertTrue(all(len(part) <= 4000 for part in parts))
+        with patch('bot.answer', new_callable=AsyncMock, return_value=long_answer):
+            await ask_command(self.update, self.context)
+        self.assertEqual(self.message.reply_text.await_count, 3)
+
+    def test_ask_rejects_more_than_three_telegram_messages(self):
+        with self.assertRaises(ValueError):
+            split_answer('x' * 12001)
 
     async def test_other_chats_and_ordinary_messages_ignored(self):
         with patch('bot.answer', new_callable=AsyncMock) as mocked:

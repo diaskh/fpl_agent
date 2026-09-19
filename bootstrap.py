@@ -11,7 +11,8 @@ BOOTSTRAP_TABLES = tuple(t for t, _ in SECTIONS.values()) + (
     'game_settings', 'game_config', 'bootstrap_summary', 'bootstrap_extra')
 RETAINED = {'players': {'id', 'web_name'},
             'gameweeks': {'id', 'name', 'finished', 'data_checked', 'phase_id'},
-            'phases': {'id', 'name', 'start_event', 'stop_event'}}
+            'phases': {'id', 'name', 'start_event', 'stop_event'},
+            'teams': {'id', 'name'}}
 
 
 def quote(name):

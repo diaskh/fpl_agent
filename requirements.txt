@@ -4,3 +4,7 @@ aiosqlite>=0.20,<1
 openai>=1.68,<3
 APScheduler>=3.11,<4
 python-dotenv>=1.0,<2
+Pillow>=10.4,<13
+bar-chart-race==0.1.0
+pandas>=2.2,<3
+matplotlib>=3.8,<4

@@ -90,7 +90,9 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
     async def test_refresh_without_new_report(self):
         for e in self.payload['events']:
             e['finished'] = False
-        fpl = SimpleNamespace(get=AsyncMock(return_value=self.payload))
+        async def get(path):
+            return [] if path.startswith('fixtures/') else self.payload
+        fpl = SimpleNamespace(get=AsyncMock(side_effect=get))
         service = Service(Config('', 0, 0, 1, '', self.path), self.db, fpl, None)
         await service.poll(None)
         self.assertEqual((await rows(self.db, 'SELECT now_cost FROM players WHERE id=1'))[0]['now_cost'], 75)

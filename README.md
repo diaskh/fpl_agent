@@ -22,7 +22,7 @@ Fill in `.env`: bot token from BotFather, the target group's numeric chat ID, yo
 
 `backfill` immediately syncs GW1 and GW2 without sending messages or calling OpenAI. `preview N` syncs all missing gameweeks through N and prints exact JSON, also without broadcasting or using OpenAI. These commands need only `FPL_LEAGUE_ID`; export it or use `.env`.
 
-`run` starts Telegram long polling and an immediate FPL check, then repeats every 15 minutes. Each poll also saves the current gameweek after its deadline, including picks, autosubs, player points, calculated manager scores and ranks. Every successful check stores the complete latest bootstrap response, even before the first completed gameweek or when all reports have already been delivered. On first startup it backfills every completed gameweek through the latest, including GW1 and GW2, but broadcasts only the latest. Subsequent checks catch up any gameweeks completed during downtime. A sync failure leaves the gameweek unprocessed and retries at the next poll. No need to expose an inbound port.
+`run` starts Telegram long polling and an immediate FPL check, then repeats every 15 minutes. Fixtures are grouped by their exact kickoff time. The bot sends one cumulative live report only after every match in a kickoff group is marked finished; simultaneous matches produce one report, never one report per match. Each report refreshes picks, player points, calculated manager scores and ranks. On first startup, already-finished kickoff groups are recorded as a baseline and are not replayed into the chat. A sync failure leaves the group unprocessed and retries at the next poll. No need to expose an inbound port.
 
 Only `ADMIN_TELEGRAM_ID` can use `/report` or `/report 2`. Other users are silently ignored. An admin report deliberately rebroadcasts a previously completed report; a partially delivered report resumes its saved messages. Reports always go to `TELEGRAM_CHAT_ID`, even when the command is issued in a private chat. The default is the current gameweek after its deadline, falling back to the latest completed gameweek. Live reports refresh the database first and show provisional results with a UTC timestamp. Future gameweeks are rejected. Live reports do not mark the final automatic report delivered.
 
@@ -36,6 +36,22 @@ reliable group trigger with Telegram privacy mode enabled; mentions depend on Te
 actually delivering the message to the bot. No privacy-setting change is required for
 commands. Replies include the directly replied-to bot message as context; there is no
 persistent conversation memory or automatic Telegram-to-FPL identity mapping.
+
+Every group member can request fact-based PNGs with `/graph` or `/graph latest` for the
+latest-gameweek score chart, and `/graph history` for the season-long rank race. Each
+command sends two images: the current top 10 first, then the complete mini-league. The
+command refreshes FPL before drawing, marks live data as provisional, includes the exact
+UTC sync time, and uses only calculated database values (no model-generated numbers or
+claims).
+
+`/race` refreshes the latest data and sends an MP4 bar-chart race for every manager in
+the mini-league, covering GW1 through the latest available gameweek and animating
+cumulative total points. It uses `bar-chart-race==0.1.0` with a wide pandas DataFrame as
+required by the package. A manager without earlier verified league snapshots remains
+absent until their first stored gameweek; the bot never substitutes unknown scores with
+zero. MP4 output requires FFmpeg to be installed and visible on PATH.
+Race timing adapts to the number of stored gameweeks, targets roughly fifteen seconds,
+renders approximately 30 frames per second, and briefly pauses on each gameweek.
 Each request sends the current question, at most 2,500 characters of the directly
 replied-to bot message, the database schema and synced-week coverage. Query results
 are retained only for that request's query/answer loop; other group messages and prior
@@ -65,8 +81,8 @@ was refreshed then.
 Questions read a consistent snapshot of the existing database; they do not refresh FPL or
 send reports. Invalidated gameweeks are excluded. Historical results are available only for synced gameweeks. Latest bootstrap player prices,
 news/availability, positions, season statistics (including defensive contribution when supplied),
-club information, future deadlines and API game settings are available. Full fixtures,
-manager transfer history, historical prices and the full rules document are not stored.
+club information, future deadlines, official fixture scores and API game settings are available.
+Manager transfer history, historical prices and the full rules document are not stored.
 Current season totals must not be presented as individual gameweek statistics. Historical
 strategy remains opinion, not a forecast.
 
@@ -77,7 +93,8 @@ are denied. Queries have a two-second execution budget, a 100-row result limit a
 bounded payload; oversized results are rejected rather than silently truncated. Errors can
 be corrected within the query budget; exhausted budgets/API failures return an inability
 to verify an answer. One question runs at a time, with a 10-second per-user cooldown and
-a 1,500-character question limit. Replies are plain text.
+a 1,500-character question limit. Replies are plain text and are sent as one, two, or at
+most three Telegram messages according to length, split at natural boundaries.
 
 Questions, direct bot reply context, and relevant public FPL query results are sent to
 OpenAI. Secrets and unrelated chat history are not included. Restart the bot process to

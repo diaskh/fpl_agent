@@ -40,7 +40,8 @@ def blocks(stats):
     # Local month labels avoid injecting English FPL phase labels into Russian prose.
     month_names = {"August": "Август", "September": "Сентябрь", "October": "Октябрь", "November": "Ноябрь", "December": "Декабрь", "January": "Январь", "February": "Февраль", "March": "Март", "April": "Апрель", "May": "Май", "June": "Июнь", "July": "Июль"}
     month = month_names.get(phase["name"], phase["name"])
-    live_note = (f' · Предварительно · {stats["synced_at"]} UTC\nОчки по текущим множителям FPL с вычетом штрафов за трансферы. Бонусы, автозамены и капитан могут измениться.' if stats.get("provisional") else "")
+    group_note = f' · после матчей {stats["fixture_group_label"]}' if stats.get("fixture_group_label") else ""
+    live_note = (f'{group_note} · Предварительно · {stats["synced_at"]} UTC\nОчки по текущим множителям FPL с вычетом штрафов за трансферы. Бонусы, автозамены и капитан могут измениться.' if stats.get("provisional") else group_note)
     return [
         {"GW_TITLE": f'⚽ Результаты тура {stats["gameweek"]}' + live_note,
          "SCORERS": "🏆 Лучшие по очкам\n" + table(stats["top_scorers"]),

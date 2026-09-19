@@ -11,8 +11,10 @@ from unittest.mock import AsyncMock, patch
 import httpx
 from telegram.error import Forbidden, TimedOut
 
-from bot import Config, Service, report_command
-from data import FPL, Store, calculate, connect, historical_ranks, latest_completed, month_phase, rows
+from bot import Config, Service, graph_command, race_command, report_command
+from charts import chart_spec
+from race import race_spec
+from data import FPL, Store, calculate, completed_fixture_groups, connect, historical_ranks, latest_completed, month_phase, rows
 from formatting import blocks, escaped, format_messages, render
 
 
@@ -56,6 +58,8 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
                 result["picks"][0]["multiplier"] = 3
                 result["picks"][0]["is_captain"] = False  # Acting vice captain.
             return result
+        if path.startswith("fixtures/"):
+            return []
         return self.live
 
     async def seed(self):
@@ -82,6 +86,16 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(query(db, "SELECT * FROM picks WHERE gw_id=3")), 30)
         finally:
             db.close()
+
+    async def test_fixture_snapshot_stores_scores_and_status(self):
+        await self.store.sync_bootstrap(self.bootstrap)
+        await self.store.sync_fixtures([{
+            'id': 10, 'event': 2, 'kickoff_time': '2026-08-02T14:00:00Z',
+            'team_h': 1, 'team_a': 1, 'team_h_score': 3, 'team_a_score': 1,
+            'started': True, 'finished': True, 'finished_provisional': False, 'minutes': 90,
+        }])
+        fixture_rows = await rows(self.db, 'SELECT * FROM fixtures')
+        self.assertEqual((fixture_rows[0]['team_h_score'], fixture_rows[0]['finished']), (3, 1))
 
     async def test_live_refresh_failure_and_finalization(self):
         await self.make_live()
@@ -118,7 +132,7 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
         self.live["elements"][0]["stats"]["total_points"] = 9
         await service.poll(None)
         self.assertEqual((await calculate(self.db, 3))["top_scorers"][0]["points"], 23)
-        self.assertEqual([c.args[1] for c in service.broadcast.call_args_list], [2])
+        service.broadcast.assert_not_awaited()
 
     async def test_exact_metrics_and_as_of_month(self):
         await self.seed()
@@ -254,15 +268,32 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await calculate(self.db, 2))["season_best_captain"]["points"], 30)
         self.assertEqual((await rows(self.db, "SELECT COUNT(*) AS n FROM picks"))[0]["n"], 60)
 
-    async def test_poll_first_start_and_catchup(self):
+    async def test_poll_sends_only_after_entire_kickoff_group_finishes(self):
         service = Service(Config("", -100, 1, 836115, "", ""), self.db, self.fpl, None)
-        service.broadcast = AsyncMock()
+        self.bootstrap["events"][2].update(finished=False, data_checked=False, is_current=True)
+        self.picks["entry_history"] = {"event": 3, "points": 6, "total_points": 86,
+                                       "event_transfers_cost": 4, "event_transfers": 1}
+        fixtures = [
+            {"id": 1, "event": 3, "team_h": 1, "team_a": 1, "kickoff_time": "2026-09-19T16:30:00Z", "finished": True},
+            {"id": 2, "event": 3, "team_h": 1, "team_a": 1, "kickoff_time": "2026-09-19T19:00:00Z", "finished": False},
+            {"id": 3, "event": 3, "team_h": 1, "team_a": 1, "kickoff_time": "2026-09-19T19:00:00Z", "finished": False},
+        ]
+        original_get = self.get
+        async def get_with_fixtures(path, **kwargs):
+            return fixtures if path.startswith("fixtures/") else await original_get(path)
+        self.fpl.get = AsyncMock(side_effect=get_with_fixtures)
+        service.fpl = self.fpl
+        service.store.fpl = self.fpl
+        service.broadcast_fixture_group = AsyncMock()
+        # First poll establishes a baseline and does not replay completed groups.
         await service.poll(None)
-        self.assertEqual([call.args[1] for call in service.broadcast.call_args_list], [3])
-        await service.set_metadata("poll_baseline", "2")
-        service.broadcast.reset_mock()
+        service.broadcast_fixture_group.assert_not_awaited()
+        fixtures[1]["finished"] = True
         await service.poll(None)
-        self.assertEqual([call.args[1] for call in service.broadcast.call_args_list], [2, 3])
+        service.broadcast_fixture_group.assert_not_awaited()
+        fixtures[2]["finished"] = True
+        await service.poll(None)
+        service.broadcast_fixture_group.assert_awaited_once_with(None, 3, "2026-09-19T19:00:00Z", self.bootstrap)
 
     async def test_membership_change_invalidates_later_snapshots(self):
         await self.store.ensure_through(3, self.bootstrap)
@@ -279,6 +310,57 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
         await report_command(update, context)
         service.broadcast.assert_awaited_once_with(bot, 2, self.bootstrap, force=True)
 
+    async def test_graph_command_refreshes_and_sends_latest_chart(self):
+        await self.seed()
+        service = Service(Config("", -100, 1, 836115, "", ""), self.db, self.fpl, None)
+        message = SimpleNamespace(reply_text=AsyncMock(), reply_photo=AsyncMock())
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=2, is_bot=False),
+                                 effective_chat=SimpleNamespace(id=-100), effective_message=message)
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"service": service}), args=["latest"])
+        with patch("bot.render_chart", return_value=SimpleNamespace(name="chart.png")):
+            await graph_command(update, context)
+        self.assertEqual(message.reply_photo.await_count, 2)
+        self.assertIn("Топ-10", message.reply_photo.call_args_list[0].kwargs["caption"])
+        self.assertIn("Вся мини-лига", message.reply_photo.call_args_list[1].kwargs["caption"])
+
+    async def test_chart_spec_supports_top_ten_and_all_scopes(self):
+        await self.store.ensure_through(3, self.bootstrap)
+        latest = await chart_spec(self.db, 2, "latest", "top10")
+        self.assertEqual(latest["kind"], "latest")
+        self.assertEqual(latest["median"], 35)
+        historical = await chart_spec(self.db, 3, "history", "all")
+        self.assertEqual(historical["kind"], "history")
+        self.assertEqual({r["entry_name"] for r in historical["rows"]}, {"Team_1!*", "Team_2!*"})
+
+    async def test_race_command_sends_whole_league_video(self):
+        await self.seed()
+        service = Service(Config("", -100, 1, 836115, "", ""), self.db, self.fpl, None)
+        message = SimpleNamespace(reply_text=AsyncMock(), reply_video=AsyncMock())
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=2, is_bot=False),
+                                 effective_chat=SimpleNamespace(id=-100), effective_message=message)
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"service": service}), args=[])
+        with patch("bot.render_race", return_value=SimpleNamespace(name="race.mp4")):
+            await race_command(update, context)
+        message.reply_video.assert_awaited_once()
+        sent = message.reply_video.call_args.kwargs
+        self.assertTrue(sent["supports_streaming"])
+        self.assertIn("Вся мини-лига", sent["caption"])
+
+    async def test_race_spec_contains_every_manager_and_week(self):
+        await self.seed()
+        spec = await race_spec(self.db, 2)
+        self.assertEqual(len(spec["rows"]), 4)
+        self.assertEqual(set(spec["labels"]), {1, 2})
+
+    async def test_race_spec_allows_late_manager_without_inventing_zeros(self):
+        await self.seed()
+        await self.db.execute("INSERT INTO managers VALUES (3,'Late Team','Late Manager')")
+        await self.db.execute("INSERT INTO standings VALUES (3,2,3,NULL,25,25)")
+        await self.db.commit()
+        spec = await race_spec(self.db, 2)
+        late = [r for r in spec["rows"] if r["entry_id"] == 3]
+        self.assertEqual([(r["gw_id"], r["total_points"]) for r in late], [(2, 25)])
+
     async def test_unauthorized_command_is_silent(self):
         service = Service(Config("", -100, 1, 836115, "", ""), self.db, self.fpl, None)
         context = SimpleNamespace(application=SimpleNamespace(bot_data={"service": service}))
@@ -289,6 +371,11 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PureTests(unittest.TestCase):
+    def test_completed_fixture_groups_require_every_simultaneous_match(self):
+        fixtures = [{"kickoff_time": "2026-09-19T16:30:00Z", "finished": True},
+                    {"kickoff_time": "2026-09-19T19:00:00Z", "finished": True},
+                    {"kickoff_time": "2026-09-19T19:00:00Z", "finished": False}]
+        self.assertEqual(completed_fixture_groups(fixtures), ["2026-09-19T16:30:00Z"])
     def test_transfer_tiebreak(self):
         history = {1: [{"event": 1, "total_points": 50, "rank_transfers": 2}],
                    2: [{"event": 1, "total_points": 50, "rank_transfers": 0}],

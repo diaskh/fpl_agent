@@ -20,9 +20,11 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-from data import FPL, Store, calculate, connect, latest_completed, latest_available, rows
+from data import FPL, Store, calculate, completed_fixture_groups, connect, latest_completed, latest_available, rows
 from formatting import format_messages
 from questions import answer, error_text
+from charts import chart_spec, render_chart
+from race import race_spec, render_race
 
 LOG = logging.getLogger(__name__)
 
@@ -103,6 +105,43 @@ class Service:
             await self.db.commit()
         return True
 
+    async def broadcast_fixture_group(self, bot, gw, kickoff, bootstrap):
+        """Send one cumulative live report after every match at kickoff has finished."""
+        pending = await rows(self.db, "SELECT * FROM fixture_reports WHERE gw_id=? AND kickoff_time=?", (gw, kickoff))
+        marker = f"sending-fixture:{gw}:{kickoff}"
+        ambiguous = await rows(self.db, "SELECT value FROM metadata WHERE key=?", (marker,))
+        if ambiguous:
+            raise RuntimeError(f"GW{gw} fixture group {kickoff} has an uncertain Telegram delivery")
+        if pending and pending[0]["sent_count"] == 2:
+            return False
+        if not pending:
+            await self.store.ensure_through(gw, bootstrap)
+            stats = await calculate(self.db, gw)
+            stats["fixture_group_label"] = kickoff[11:16] + " UTC"
+            messages = await format_messages(self.llm, stats)
+            await self.db.execute("INSERT INTO fixture_reports(gw_id,kickoff_time,messages) VALUES (?,?,?)",
+                                  (gw, kickoff, json.dumps(messages, ensure_ascii=False)))
+            await self.db.commit()
+            sent_count = 0
+        else:
+            messages = json.loads(pending[0]["messages"])
+            sent_count = pending[0]["sent_count"]
+        for index in range(sent_count, 2):
+            if index:
+                await asyncio.sleep(2)
+            await self.set_metadata(marker, str(index))
+            try:
+                await bot.send_message(chat_id=self.config.chat_id, text=messages[index], parse_mode=ParseMode.MARKDOWN_V2)
+            except (BadRequest, Forbidden, RetryAfter):
+                await self.db.execute("DELETE FROM metadata WHERE key=?", (marker,))
+                await self.db.commit()
+                raise
+            await self.db.execute("UPDATE fixture_reports SET sent_count=?,completed_at=CASE WHEN ?=2 THEN CURRENT_TIMESTAMP ELSE NULL END WHERE gw_id=? AND kickoff_time=?",
+                                  (index + 1, index + 1, gw, kickoff))
+            await self.db.execute("DELETE FROM metadata WHERE key=?", (marker,))
+            await self.db.commit()
+        return True
+
     async def poll(self, bot):
         if self.lock.locked():
             return
@@ -110,23 +149,28 @@ class Service:
             try:
                 bootstrap = await self.fpl.get("bootstrap-static/")
                 await self.store.sync_bootstrap(bootstrap)
-                latest = latest_completed(bootstrap)
+                fixtures = await self.fpl.get("fixtures/")
+                await self.store.sync_fixtures(fixtures)
                 available = latest_available(bootstrap)
-                if available is not None and available != latest:
-                    await self.store.ensure_through(available, bootstrap)
-                if latest is None:
+                if available is None:
                     return
-                # Resume failed older reports, then publish every newly completed GW.
-                completed = [e["id"] for e in bootstrap["events"] if e["finished"] and e["data_checked"]]
-                baseline = await rows(self.db, "SELECT value FROM metadata WHERE key='poll_baseline'")
+                # Keep the live snapshot fresh even while the current fixture group is playing.
+                await self.store.ensure_through(available, bootstrap)
+                current_fixtures = [f for f in fixtures if f.get("event") == available]
+                completed = completed_fixture_groups(current_fixtures)
+                baseline_key = f"fixture-baseline:{available}"
+                baseline = await rows(self.db, "SELECT value FROM metadata WHERE key=?", (baseline_key,))
                 if not baseline:
-                    # Initial deployment backfills history but publishes just the latest.
-                    await self.set_metadata("poll_baseline", str(latest))
-                    baseline = [{"value": str(latest)}]
-                pending = {r["gw_id"] for r in await rows(self.db, "SELECT gw_id FROM reports WHERE sent_count<2")}
-                targets = pending | {g for g in completed if g >= int(baseline[0]["value"])}
-                for gw in sorted(targets):
-                    await self.broadcast(bot, gw, bootstrap)
+                    # A new deployment never floods the chat with already completed groups.
+                    await self.set_metadata(baseline_key, json.dumps(completed))
+                    baseline_groups = set(completed)
+                else:
+                    baseline_groups = set(json.loads(baseline[0]["value"]))
+                delivered = {r["kickoff_time"] for r in await rows(
+                    self.db, "SELECT kickoff_time FROM fixture_reports WHERE gw_id=? AND sent_count=2", (available,))}
+                for kickoff in completed:
+                    if kickoff not in baseline_groups and kickoff not in delivered:
+                        await self.broadcast_fixture_group(bot, available, kickoff, bootstrap)
             except Exception as exc:
                 # Avoid logging URLs containing Telegram tokens or response bodies.
                 LOG.error("Polling failed (%s). Check connectivity/configuration and pending deliveries.", type(exc).__name__)
@@ -153,6 +197,7 @@ async def report_command(update, context):
         try:
             bootstrap = await service.fpl.get("bootstrap-static/")
             await service.store.sync_bootstrap(bootstrap)
+            await service.store.sync_fixtures(await service.fpl.get("fixtures/"))
             gw = gw or latest_available(bootstrap)
             if gw is None:
                 await message.reply_text("Пока нет завершённого тура с проверенными данными.")
@@ -177,6 +222,105 @@ async def report_command(update, context):
 
 async def ask_command(update, context):
     await question_message(update, context, command=True)
+
+
+async def graph_command(update, context):
+    """Refresh league data and reply with a sourced editorial chart."""
+    service = context.application.bot_data["service"]
+    message, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if not message or not user or user.is_bot or not chat or chat.id != service.config.chat_id:
+        return
+    if len(context.args) > 1:
+        await message.reply_text("Использование: /graph [latest|history]")
+        return
+    choice = context.args[0].lower() if context.args else "latest"
+    if choice not in ("latest", "history"):
+        await message.reply_text("Использование: /graph [latest|history]")
+        return
+    if service.lock.locked():
+        await message.reply_text("Данные уже обновляются. Попробуйте ещё раз через минуту.")
+        return
+    async with service.lock:
+        try:
+            bootstrap = await service.fpl.get("bootstrap-static/")
+            await service.store.sync_bootstrap(bootstrap)
+            await service.store.sync_fixtures(await service.fpl.get("fixtures/"))
+            current = latest_available(bootstrap)
+            gw = current
+            if gw is None:
+                await message.reply_text("Для этого тура ещё нет доступных данных.")
+                return
+            await service.store.ensure_through(gw, bootstrap)
+            specs = [await chart_spec(service.db, gw, choice, scope) for scope in ("top10", "all")]
+            photos = [await asyncio.to_thread(render_chart, spec) for spec in specs]
+            state = ("предварительный срез — цифры могут измениться"
+                     if specs[0]["provisional"] else "данные подтверждены FPL")
+            labels = ("Топ-10", "Вся мини-лига")
+            for photo, label in zip(photos, labels):
+                await message.reply_photo(photo=photo, caption=f"{label} • GW{gw}: {state}.")
+        except Exception as exc:
+            LOG.error("Graph generation failed (%s)", type(exc).__name__)
+            await message.reply_text("Не удалось построить график по проверенным данным. Попробуйте позже.")
+
+
+async def race_command(update, context):
+    """Refresh the complete league history and send a cumulative-points MP4 race."""
+    service = context.application.bot_data["service"]
+    message, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if not message or not user or user.is_bot or not chat or chat.id != service.config.chat_id:
+        return
+    if context.args:
+        await message.reply_text("Использование: /race")
+        return
+    if service.lock.locked():
+        await message.reply_text("Данные уже обновляются. Попробуйте ещё раз через минуту.")
+        return
+    await message.reply_text("Готовлю гонку всей мини-лиги — это может занять около минуты…")
+    try:
+        async with service.lock:
+            bootstrap = await service.fpl.get("bootstrap-static/")
+            await service.store.sync_bootstrap(bootstrap)
+            await service.store.sync_fixtures(await service.fpl.get("fixtures/"))
+            gw = latest_available(bootstrap)
+            if gw is None:
+                await message.reply_text("Пока недостаточно данных для гонки.")
+                return
+            await service.store.ensure_through(gw, bootstrap)
+            spec = await race_spec(service.db, gw)
+        video = await asyncio.to_thread(render_race, spec)
+        state = "предварительные данные" if spec["provisional"] else "подтверждённые данные"
+        await message.reply_video(video=video, supports_streaming=True,
+                                  caption=f"Вся мини-лига • GW1–GW{gw} • {state}. Очки нарастающим итогом; поздние участники появляются с первого сохранённого тура.")
+    except Exception as exc:
+        LOG.exception("Bar chart race generation failed (%s)", type(exc).__name__)
+        await message.reply_text("Не удалось создать гонку. Проверьте bar-chart-race и FFmpeg в окружении бота.")
+
+
+def split_answer(text, limit=4000, max_messages=3):
+    """Split plain-text /ask output at natural boundaries within Telegram limits."""
+    parts = []
+    remaining = text.strip()
+    while remaining:
+        if len(parts) == max_messages - 1:
+            if len(remaining) > limit:
+                raise ValueError("Answer exceeds Telegram message budget")
+            parts.append(remaining)
+            break
+        if len(remaining) <= limit:
+            parts.append(remaining)
+            break
+        window = remaining[:limit + 1]
+        candidates = [window.rfind(boundary, 0, limit + 1)
+                      for boundary in ('\n\n', '\n', '. ', '! ', '? ', ' ')]
+        cut = max((position for position in candidates if position >= limit // 2), default=limit)
+        if window[cut:cut + 2] in ('. ', '! ', '? '):
+            cut += 1
+        part = remaining[:cut].rstrip()
+        if not part:
+            part, cut = remaining[:limit], limit
+        parts.append(part)
+        remaining = remaining[cut:].lstrip()
+    return parts
 
 
 async def question_message(update, context, command=False):
@@ -208,7 +352,8 @@ async def question_message(update, context, command=False):
     service.question_times[user.id] = now
     async with service.question_lock:
         result = await answer(service, question, (replied.text or "")[:2500] if replying else "")
-        await message.reply_text(result, parse_mode=None)
+        for part in split_answer(result):
+            await message.reply_text(part, parse_mode=None)
 
 
 async def post_init(app):
@@ -263,6 +408,8 @@ async def cli(args, config):
             return
         bootstrap = await fpl.get("bootstrap-static/")
         store = Store(db, fpl, config.league_id)
+        await store.sync_bootstrap(bootstrap)
+        await store.sync_fixtures(await fpl.get("fixtures/"))
         target = latest_available(bootstrap) if args.command == "sync" else (2 if args.command == "backfill" else args.gw)
         await store.ensure_through(target, bootstrap)
         if args.command == "preview":
@@ -305,6 +452,8 @@ def main():
                .post_stop(post_stop).post_shutdown(post_shutdown).build())
         app.bot_data["config"] = config
         app.add_handler(CommandHandler("report", report_command))
+        app.add_handler(CommandHandler("graph", graph_command, block=False))
+        app.add_handler(CommandHandler("race", race_command, block=False))
         app.add_handler(CommandHandler("ask", ask_command, block=False))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, question_message, block=False))
         app.run_polling(allowed_updates=["message"], drop_pending_updates=True)

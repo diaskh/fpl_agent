@@ -1,9 +1,12 @@
 """Bounded FPL question answering over an isolated, read-only SQLite snapshot."""
 import asyncio
+from difflib import SequenceMatcher
 import json
 import logging
+import re
 import sqlite3
 import time
+import unicodedata
 
 from openai import RateLimitError, AuthenticationError, APIConnectionError, APITimeoutError
 
@@ -12,8 +15,9 @@ from bootstrap import BOOTSTRAP_TABLES
 
 LOG = logging.getLogger(__name__)
 TABLES = ('managers', 'phases', 'gameweeks', 'players', 'standings', 'picks',
-          'autosubs', 'live_points', 'sync_runs', 'result_status') + BOOTSTRAP_TABLES
+          'autosubs', 'live_points', 'sync_runs', 'result_status', 'fixtures') + BOOTSTRAP_TABLES
 FAILURE = 'Не удалось проверить ответ по базе FPL. Попробуйте ещё раз или уточните команду и тур.'
+MAX_ANSWER_CHARS = 10500
 POLICY = """You are a helpful chat assistant with access to this league's FPL database.
 Answer general questions as well as FPL questions. General questions do not require a
 database query. For FPL statistics, ground the answer in retrieved database records.
@@ -50,7 +54,13 @@ game_settings/game_config/bootstrap_extra are key/value tables whose value is JS
 bootstrap_summary.fetched_at is the latest bootstrap timestamp in UTC; cite it for current data.
 Current player season totals, including defensive_contribution when present, are NOT
 per-gameweek values or historical prices. Never substitute total_points for DEFCON.
-No fixture list, manager transfer history, price history, or full rules document is stored.
+fixtures contains the latest official match schedule and scores. Join fixtures.team_h and
+fixtures.team_a to teams.id twice to name both clubs. fixtures.event is the gameweek;
+finished=1 means the match has ended, while a nullable score is unknown. Determine a
+match's status from fixtures, not from gameweeks.finished: the latter describes completion
+and FPL verification of the whole gameweek. A gameweek can remain provisional after an
+individual match is finished. No manager transfer history, price history, or full rules
+document is stored.
 Use only actual settings and fields available; missing values mean unknown.
 Strategy must be labelled opinion based on stored results, not a forecast.
 Ask for a team/entry ID if 'me' or a name is ambiguous; Telegram IDs are not FPL IDs.
@@ -65,6 +75,56 @@ from official monthly scoring. Distinguish cumulative total_points from summed e
 Only synced gameweeks have historical results. Future gameweek definitions are not results.
 Missing rows mean unknown, never zero.
 """
+
+CYRILLIC = str.maketrans({
+    'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh','з':'z','и':'i','й':'y',
+    'к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f',
+    'х':'h','ц':'ts','ч':'ch','ш':'sh','щ':'sch','ъ':'','ы':'y','ь':'','э':'e',
+    'ю':'yu','я':'ya','ә':'a','ғ':'g','қ':'q','ң':'n','ө':'o','ұ':'u','ү':'u','һ':'h','і':'i'
+})
+
+
+def normalized_name(value):
+    value = unicodedata.normalize('NFKD', str(value).lower()).translate(CYRILLIC)
+    value = ''.join(c for c in value if not unicodedata.combining(c))
+    return ' '.join(re.findall(r'[a-z0-9]+', value))
+
+
+def name_candidates(db, text, limit=8):
+    """Resolve misspelled or Cyrillic names to bounded, database-backed candidates."""
+    query_text = normalized_name(text)
+    words = query_text.split()
+    if not words:
+        return []
+    entities = []
+    for row in db.execute('SELECT entry_id,entry_name,player_name FROM managers'):
+        entities.extend((('fantasy_team', row['entry_id'], row['entry_name'], 'entry_name'),
+                         ('manager', row['entry_id'], row['player_name'], 'player_name')))
+    for row in db.execute('SELECT id,web_name FROM players'):
+        entities.append(('footballer', row['id'], row['web_name'], 'web_name'))
+    try:
+        for row in db.execute('SELECT id,name FROM teams'):
+            entities.append(('football_club', row['id'], row['name'], 'name'))
+    except sqlite3.Error:
+        pass
+    matches = []
+    for entity, identifier, canonical, field in entities:
+        target = normalized_name(canonical)
+        if len(target) < 2:
+            continue
+        target_words = target.split()
+        sizes = range(max(1, len(target_words) - 1), len(target_words) + 2)
+        phrases = [' '.join(words[i:i + size]) for size in sizes
+                   for i in range(max(0, len(words) - size + 1))]
+        score = 1.0 if target in query_text else max(
+            (SequenceMatcher(None, target, phrase).ratio() for phrase in phrases), default=0)
+        # Longer names tolerate transliteration variants and Russian case endings.
+        threshold = 0.68 if len(target) >= 5 else 0.78
+        if score >= threshold:
+            matches.append({'entity': entity, 'id': identifier, 'name': canonical,
+                            'field': field, 'confidence': round(score, 3)})
+    matches.sort(key=lambda row: (-row['confidence'], row['entity'], row['id']))
+    return matches[:limit]
 
 
 ERROR_TEXT = {
@@ -102,7 +162,7 @@ async def snapshot(service):
             await service.db.backup(db)
         # Strip operational data and invalidated historical snapshots before model access.
         db.execute('PRAGMA foreign_keys=OFF')
-        for table in ('metadata', 'reports'):
+        for table in ('metadata', 'reports', 'fixture_reports'):
             db.execute(f'DROP TABLE {table}')
         for table in ('standings', 'picks', 'autosubs', 'live_points'):
             db.execute(f'DELETE FROM {table} WHERE gw_id NOT IN (SELECT gw_id FROM sync_runs)')
@@ -167,7 +227,7 @@ def named_query(db, sql):
 
 async def completion(llm, messages):
     response = await llm.chat.completions.create(
-        model='gpt-4o-mini', temperature=0, max_tokens=1800,
+        model='gpt-4o-mini', temperature=0, max_tokens=4000,
         response_format={'type': 'json_object'}, messages=messages)
     if response.choices[0].finish_reason != 'stop':
         raise ValueError('Incomplete model response')
@@ -181,9 +241,10 @@ async def answer(service, question, reply_context=''):
     db = None
     try:
         db, schema, coverage = await snapshot(service)
+        candidates = name_candidates(db, question + ' ' + reply_context)
         messages = [{'role': 'system', 'content': POLICY + '''
 Return JSON with action: "query" or "answer". For query supply sql (one
-SQLite SELECT). For answer supply text (under 2200 characters) and basis:
+SQLite SELECT). For answer supply concise text (under 10500 characters) and basis:
 "general" for general knowledge, or "database" for FPL statistics from stored records.
 General answers may be returned immediately. For FPL statistics you MUST query the
 database before answering and use basis "database". You can
@@ -192,7 +253,12 @@ lookup before choosing ambiguous names. Include readable team/manager/player nam
 and gameweeks in results; IDs may be included internally for joins and disambiguation.
 An answer must cite retrieved rows, state missing coverage and not guess. No records
 means explain unavailable data. Use concise plain text, no Markdown tables.
-Schema:\n''' + schema + '\nSynced gameweeks and UTC timestamps: ' + json.dumps(coverage)},
+Name candidates below were produced deterministically from database names using
+normalization, Cyrillic transliteration and fuzzy spelling comparison. Use their exact
+name/ID in SQL when they fit the question. If similarly ranked candidates remain
+ambiguous, query them and ask the user to clarify instead of guessing.
+Schema:\n''' + schema + '\nSynced gameweeks and UTC timestamps: ' + json.dumps(coverage) +
+                    '\nResolved name candidates: ' + json.dumps(candidates, ensure_ascii=False)},
                     {'role': 'user', 'content': json.dumps({'question': question, 'reply_context': reply_context}, ensure_ascii=False)}]
         bootstrap_stamp = [dict(r) for r in db.execute('SELECT fetched_at FROM bootstrap_summary WHERE id=1')]
         if bootstrap_stamp:
@@ -203,7 +269,7 @@ Schema:\n''' + schema + '\nSynced gameweeks and UTC timestamps: ' + json.dumps(c
             action = result.get('action')
             if action == 'answer':
                 value = result.get('text')
-                if not isinstance(value, str) or not value.strip() or len(value) > 2200:
+                if not isinstance(value, str) or not value.strip() or len(value) > MAX_ANSWER_CHARS:
                     raise ValueError('Invalid answer')
                 basis = result.get('basis', 'database')
                 if basis not in ('general', 'database'):
