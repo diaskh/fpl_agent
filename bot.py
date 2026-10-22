@@ -24,6 +24,7 @@ from charts import chart_spec, render_chart
 from race import race_spec, render_race
 from density import render_density
 from deadline import build_messages, passed_deadlines
+from cup import Cup
 
 LOG = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ class Service:
         self.config, self.db, self.fpl, self.llm = config, db, fpl, llm
         self.store = Store(db, fpl, config.league_id)
         self.lock = asyncio.Lock()
+        self.cup = Cup(db, fpl, config.league_id, config.chat_id)
 
     async def set_metadata(self, key, value):
         await self.db.execute("INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
@@ -187,6 +189,12 @@ class Service:
         async with self.lock:
             try:
                 bootstrap = await self.fpl.get("bootstrap-static/")
+                # Cup settlement/publication is independent of regular live reports.
+                try:
+                    await self.cup.advance(bootstrap)
+                    await self.cup.deliver(bot)
+                except Exception as exc:
+                    LOG.error("Cup polling failed (%s)", type(exc).__name__)
                 await self.poll_deadlines(bot, bootstrap)
                 await self.store.sync_bootstrap(bootstrap)
                 fixtures = await self.fpl.get("fixtures/")
@@ -214,6 +222,48 @@ class Service:
             except Exception as exc:
                 # Avoid logging URLs containing Telegram tokens or response bodies.
                 LOG.error("Polling failed (%s). Check connectivity/configuration and pending deliveries.", type(exc).__name__)
+
+
+async def cup_command(update, context):
+    """Public bracket; admin-only creation, with no inline buttons."""
+    service = context.application.bot_data["service"]
+    message, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if not message or not user or user.is_bot or not chat:
+        return
+    starting = bool(context.args and context.args[0].lower() == "start")
+    if starting and user.id != service.config.admin_id:
+        return
+    if not starting and chat.id != service.config.chat_id:
+        return
+    if (not starting and context.args) or (starting and len(context.args) > 2):
+        await message.reply_text("Использование: /cup · администратору: /cup start [тур]")
+        return
+    if service.lock.locked():
+        await message.reply_text("Данные уже обновляются. Попробуйте через минуту.")
+        return
+    async with service.lock:
+        try:
+            if starting:
+                try:
+                    gw = int(context.args[1]) if len(context.args) == 2 else None
+                except ValueError:
+                    await message.reply_text("Использование: /cup start [номер тура]")
+                    return
+                bootstrap = await service.fpl.get("bootstrap-static/")
+                await service.store.sync_bootstrap(bootstrap)
+                await service.cup.start(bootstrap, gw)
+                await service.cup.deliver(context.bot)
+            else:
+                _, state = await service.cup.latest()
+                if not state:
+                    await message.reply_text("Кубок ещё не создан. Администратор может запустить его: /cup start [тур].")
+                    return
+                await service.cup.show(context.bot, state)
+        except ValueError as exc:
+            await message.reply_text(str(exc))
+        except Exception as exc:
+            LOG.error("Cup command failed (%s)", type(exc).__name__)
+            await message.reply_text("Не удалось отправить кубок. Если жеребьёвка сохранена, она не изменится. Проверьте журнал и cup-status; отправка с неопределённым статусом требует cup-resolve.")
 
 
 async def report_command(update, context):
@@ -436,6 +486,19 @@ async def cli(args, config):
     db = await connect(config.database)
     fpl = FPL()
     try:
+        if args.command == "cup-status":
+            print(json.dumps(await rows(db, "SELECT cup_id,stage,sent_count,uncertain FROM cup_posts ORDER BY cup_id,stage"), indent=2))
+            return
+        if args.command == "cup-resolve":
+            post = await rows(db, "SELECT * FROM cup_posts WHERE cup_id=? AND stage=?", (args.cup_id, args.stage))
+            if not post or not post[0]["uncertain"]:
+                raise ValueError("No uncertain cup delivery exists for this post")
+            if args.count not in (post[0]["sent_count"], post[0]["sent_count"] + 1):
+                raise ValueError("Count must equal confirmed count or confirmed count plus one")
+            await db.execute("UPDATE cup_posts SET sent_count=?,uncertain=0 WHERE cup_id=? AND stage=?", (args.count, args.cup_id, args.stage))
+            await db.commit()
+            print("Cup delivery resolved; restart the service to resume.")
+            return
         if args.command == "status":
             print(json.dumps({"reports": await rows(db, "SELECT gw_id,sent_count,completed_at FROM reports ORDER BY gw_id"), "uncertain": await rows(db, "SELECT key,value FROM metadata WHERE key LIKE 'sending:%'")}, indent=2))
             return
@@ -474,6 +537,11 @@ def main():
     sub.add_parser("backfill")
     sub.add_parser("sync")
     sub.add_parser("status")
+    sub.add_parser("cup-status", help="Show cup publication progress and uncertain sends")
+    cup_resolve = sub.add_parser("cup-resolve", help="Resolve an uncertain cup send after inspecting the chat")
+    cup_resolve.add_argument("cup_id", type=int)
+    cup_resolve.add_argument("stage", type=int, help="-1 for draw, 0 for first round, etc.")
+    cup_resolve.add_argument("count", type=int, help="Total items visibly delivered for this post")
     preview = sub.add_parser("preview")
     preview.add_argument("gw", type=int, choices=range(1, 39))
     deadline = sub.add_parser("deadline-preview", help="Print the post-deadline transfer report without sending")
@@ -506,6 +574,7 @@ def main():
         app.add_handler(CommandHandler("transfers", transfers_command, block=False))
         app.add_handler(CommandHandler("graph", graph_command, block=False))
         app.add_handler(CommandHandler("race", race_command, block=False))
+        app.add_handler(CommandHandler("cup", cup_command, block=False))
         app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
 
 

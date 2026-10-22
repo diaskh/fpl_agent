@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import io
 import math
-from pathlib import Path
+from visuals import (font as _font, headline, tracked_text, fit_text,
+                     PAPER, INK, MUTED, RULE, ACCENT)
 
 from data import rows
 
@@ -66,22 +67,6 @@ async def chart_spec(db, gw: int, requested: str, scope: str) -> dict:
             "median": median, "manager_count": len(scores)}
 
 
-def _font(size: int, bold: bool = False):
-    from PIL import ImageFont
-
-    names = (["/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"]
-             if bold else ["/System/Library/Fonts/SFNS.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf"])
-    names += (["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"] if bold else
-              ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"])
-    for name in names:
-        if Path(name).exists():
-            try:
-                return ImageFont.truetype(name, size=size)
-            except OSError:
-                pass
-    return ImageFont.load_default()
-
-
 def _text(draw, xy, text, font, fill, anchor=None):
     draw.text(xy, str(text), font=font, fill=fill, anchor=anchor)
 
@@ -92,19 +77,19 @@ def render_chart(spec: dict) -> io.BytesIO:
 
     width = 1600
     height = max(1000, 400 + len(spec["rows"]) * 52) if spec["kind"] == "latest" else 1100
-    paper, ink, muted, grid, red = "#F3F0E9", "#171717", "#6C6964", "#D4CFC5", "#D71920"
+    paper, ink, muted, grid, red = PAPER, INK, MUTED, RULE, ACCENT
     image = Image.new("RGB", (width, height), paper)
     draw = ImageDraw.Draw(image)
-    title, deck, label, small = _font(62, True), _font(29), _font(24, True), _font(20)
+    deck, label, small = _font(27), _font(24, True), _font(20)
 
     draw.rectangle((70, 52, 1530, 64), fill=ink)
     state = "LIVE / PROVISIONAL" if spec["provisional"] else "FINAL"
-    _text(draw, (70, 92), f"ELIMAI LEAGUE  /  GW{spec['gw']}  /  {state}", label, red)
+    tracked_text(draw, (70, 92), f"ELIMAI LEAGUE  /  GW{spec['gw']}  /  {state}", label, red)
 
     if spec["kind"] == "latest":
-        _text(draw, (70, 142), "Who owned the gameweek?", title, ink)
+        headline(draw, (70, 142), "Who owned the gameweek?")
         subject = "Top 10" if spec["scope"] == "top10" else "All managers"
-        _text(draw, (70, 222), f"{subject} • whole-league median shown as the benchmark", deck, muted)
+        _text(draw, (70, 244), f"{subject} • whole-league median shown as the benchmark", deck, muted)
         rows_ = spec["rows"]
         left, top, right, bottom = 390, 318, 1490, height - 128
         max_score = max(r["event_points"] for r in rows_)
@@ -116,14 +101,15 @@ def render_chart(spec: dict) -> io.BytesIO:
         for i, row in enumerate(rows_):
             cy = top + i * row_h + row_h / 2
             bar_right = left + (right - left) * row["event_points"] / axis_max
-            _text(draw, (left - 24, cy), row["entry_name"][:28], label if i == 0 else small, ink, "rm")
+            name, face = fit_text(draw, row["entry_name"], 24 if i == 0 else 20, left - 94, bold=i == 0)
+            _text(draw, (left - 24, cy), name, face, ink, "rm")
             draw.rectangle((left, cy - 14, bar_right, cy + 14), fill=red if i == 0 else ink)
             _text(draw, (bar_right + 16, cy), row["event_points"], label, ink, "lm")
         _text(draw, (70, height - 87), f"{subject} of {spec['manager_count']} managers • points after transfer costs", small, muted)
     else:
-        _text(draw, (70, 142), "The title race, gameweek by gameweek", title, ink)
+        headline(draw, (70, 142), "The title race, gameweek by gameweek", size=76)
         subject = "Current top 10" if spec["scope"] == "top10" else "Every manager"
-        _text(draw, (70, 222), f"{subject} • rank 1 is the summit", deck, muted)
+        _text(draw, (70, 244), f"{subject} • rank 1 is the summit", deck, muted)
         data = spec["rows"]
         gameweeks = sorted({r["gw_id"] for r in data})
         by_team = {}
@@ -152,7 +138,8 @@ def render_chart(spec: dict) -> io.BytesIO:
             for xx, yy in coords:
                 draw.ellipse((xx - 6, yy - 6, xx + 6, yy + 6), fill=color)
             last = points[-1]
-            _text(draw, (right + 20, y(last["rank"])), f"{name[:22]}  #{last['rank']}", label if color == red else small, color, "lm")
+            name_label, face = fit_text(draw, f"{name}  #{last['rank']}", 24 if color == red else 20, 280, bold=color == red)
+            _text(draw, (right + 20, y(last["rank"])), name_label, face, color, "lm")
         _text(draw, (70, height - 87), f"{subject} by total points • historical ranks use current league membership", small, muted)
 
     _text(draw, (1530, height - 42), f"Source: Fantasy Premier League • synced {spec['synced_at']} UTC", small, muted, "ra")

@@ -54,3 +54,12 @@ CREATE INDEX IF NOT EXISTS fixtures_event ON fixtures(event);
 CREATE TABLE IF NOT EXISTS deadline_reports (
  gw_id INTEGER PRIMARY KEY, messages TEXT NOT NULL,
  sent_count INTEGER NOT NULL DEFAULT 0 CHECK(sent_count>=0));
+
+-- Immutable cup draws, completed scores and resumable publication snapshots.
+CREATE TABLE IF NOT EXISTS cups (
+ id INTEGER PRIMARY KEY, state TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cup_posts (
+ cup_id INTEGER NOT NULL REFERENCES cups(id), stage INTEGER NOT NULL,
+ state TEXT NOT NULL, sent_count INTEGER NOT NULL DEFAULT 0,
+ uncertain INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(cup_id,stage));

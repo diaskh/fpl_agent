@@ -2,7 +2,8 @@
 import io
 import math
 from statistics import median
-from charts import _font, _text
+from charts import _text
+from visuals import font as _font, headline, tracked_text, PAPER, INK, MUTED, ACCENT, RULE
 
 
 def plural(n, forms):
@@ -94,18 +95,18 @@ def render_density(totals, synced_at, provisional=False):
     coords = dot_positions(totals, low, high)
     extra = max(0, max(abs(y) for _,y in coords)-80)
     height = 1120 + 2*extra
-    image = Image.new('RGB', (1600,height), '#F4F1E9')
+    image = Image.new('RGB', (1600,height), PAPER)
     draw = ImageDraw.Draw(image)
-    ink, muted = '#191C1B', '#74776F'
-    small, body, heading, title = _font(22), _font(27), _font(25,True), _font(70,True)
+    ink, muted = INK, MUTED
+    small, body, heading = _font(22), _font(27), _font(25,True)
     def text(x,y,s,font=body,color=ink,anchor=None):
         _text(draw,(x,y),s,font,color,anchor)
     def x(v):
         return 100+(v-low)/(high-low)*1400
-    text(80,55,'ФЭНТЕЗИ-ФУТБОЛ',heading)
+    tracked_text(draw, (80,55), 'ФЭНТЕЗИ-ФУТБОЛ', heading, ACCENT)
     text(1520,55,f'ПЛОТНОСТЬ ТАБЛИЦЫ / {teams(len(totals)).upper()}',small,muted,'ra')
     dense = next((g for i,g in enumerate(groups) if 0<i<len(groups)-1 and g['count'] >= len(totals)/2 and g['spread'] > 0),None)
-    text(80,135,'Тесно в середине.' if dense else 'Насколько плотна таблица?',title)
+    headline(draw, (80,135), 'Тесно в середине.' if dense else 'Насколько плотна таблица?', size=88, max_width=1440)
     text(80,235,f"{teams(dense['count'])} · разброс — {points(dense['spread'])}." if dense else 'Распределение команд по общей сумме очков.',body,muted)
     centre, axis = 430+extra, 580+2*extra
     fills = ['#EAE7DF','#E5DECA','#DEE3DB','#E6DBD3']
@@ -129,7 +130,7 @@ def render_density(totals, synced_at, provisional=False):
         draw.line((a,bracket_y-8,a,bracket_y,b,bracket_y,b,bracket_y-8),fill=muted,width=2)
         cx=80+col_width*(i+.5)
         draw.line(((a+b)/2,bracket_y+5,cx,bracket_y+35),fill='#C8C5BD',width=1)
-        text(cx,bracket_y+52,g['name'].upper(),heading,ink,'ma')
+        text(cx,bracket_y+52,g['name'].upper(),heading,ACCENT,'ma')
         text(cx,bracket_y+94,f"{teams(g['count'])} · {g['low']}–{points(g['high'])}",small,muted,'ma')
         lines = ([f"Всего {points(g['low'])}.", 'Команды идут вровень.'] if g['spread']==0 and g['count']>1 else
                  ['Одна команда в этой зоне.'] if g['count']==1 else

@@ -220,3 +220,61 @@ Admin-only `/transfers 7` sends the real deadline transfer/chip report for GW7 t
 `TELEGRAM_CHAT_ID`; `/transfers` selects the latest completed gameweek. Future
 deadlines are rejected. This manual command does not change automatic delivery
 records and can be requested again. Restart the bot after updating the code.
+
+### Mini-league cup
+
+After restarting the updated bot, the admin can run `/cup start` to draw a cup
+starting at the next future deadline, or `/cup start 8` to select a future GW.
+Every current Overall league member participates (2–32 supported). The draw,
+participants, random byes, and a separate random priority for tied scores are
+saved permanently. An active cup cannot be redrawn. A new cup may be created
+once the previous final has been settled.
+
+One gameweek per round. With 21 entrants there are five preliminary matches,
+eleven byes, then a round of 16, quarter-finals, semi-finals, and final: five GWs.
+The opening post includes rules, the tie priority, a preliminary image identifying
+each winner's next opponent, and the main bracket. All graphics and messages are
+Russian; no buttons are shown. `/cup` in the configured group sends both current
+images (or just the main bracket when there was no preliminary round).
+
+The existing 15-minute poll settles each round only when that GW is both
+`finished` and `data_checked` in FPL. Cup scores are official entry-history
+`points - event_transfers_cost`; chips, captaincy and autosubs are already included
+in official points. Equal scores use the published random priority, with a note
+in the results and graphic. These are this bot's cup rules, not an implementation
+of the official FPL Cup tie-break rules.
+
+The bot automatically posts round results and the updated main bracket; the
+preliminary results also include the updated preliminary image. Completed
+opponents and both scores remain in the saved bracket. If the bot was offline,
+it catches up in round order. Missing participant scores block settlement;
+leaving the league does not replace a cup entrant. Final results are frozen once
+settled. Every cup must fit within the available season gameweeks.
+
+`cups` and `cup_posts` are additive SQLite tables. Posts save a snapshot plus
+confirmed delivery progress before sending. Definitive Telegram rejections retry;
+ambiguous timeouts block subsequent automatic cup publications until inspected.
+Stop the bot and use the same environment/database as the service:
+
+```sh
+python bot.py cup-status
+# CUP_ID, STAGE (-1 for draw, 0 for first round), ITEMS_ACTUALLY_VISIBLE:
+python bot.py cup-resolve 1 -1 2
+```
+
+The visible count includes each text message and each photo separately. It must
+be the confirmed count or that count plus one. Restart the bot to resume. `/cup`
+can still display the saved current bracket without changing automatic delivery
+records. Creating and showing a cup sends to `TELEGRAM_CHAT_ID`.
+
+### Pillow visual style
+
+`visuals.py` owns the shared sports editorial palette and typography for gameweek
+charts, table density and cup graphics: warm ivory, charcoal, sports red, condensed
+uppercase Oswald headlines, and Inter body text with separate regular/bold weights.
+Both variable fonts include Cyrillic and are bundled under `assets/fonts/` with
+their SIL Open Font Licenses. Include that directory when deploying; image rendering
+requires no font downloads or system fonts. Subtitles use measured character
+tracking, and team names fit their available space before being ellipsized. Cup
+winners use bold names and a red marker; scores remain right-aligned in reserved
+space. Rendering changes do not alter the stored cup draw, results or graph data.
