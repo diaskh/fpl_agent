@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock
 from bot import Config, Service
 from bootstrap import SECTIONS, save
 from data import connect, rows
-from questions import query, snapshot
 from test_bot import fixture
 
 
@@ -103,23 +102,6 @@ class BootstrapTests(unittest.IsolatedAsyncioTestCase):
         await service.poll(None)
         self.assertEqual((await rows(self.db, 'SELECT now_cost FROM players WHERE id=1'))[0]['now_cost'], 76)
         self.assertEqual(await rows(self.db, 'SELECT * FROM sync_runs'), [])
-
-    async def test_current_data_available_to_read_only_questions(self):
-        await save(self.db, self.payload, 1)
-        service = Service(Config('', 0, 0, 1, '', self.path), self.db, None, None)
-        db, schema, coverage = await snapshot(service)
-        try:
-            result = query(db, 'SELECT p.web_name,t.name,p.now_cost / 10.0 AS price,p.defensive_contribution FROM players p JOIN teams t ON p.team=t.id WHERE p.bootstrap_current=1')
-            self.assertEqual(result[0]['price'], 7.5)
-            self.assertEqual(result[0]['defensive_contribution'], 12)
-            self.assertEqual(query(db, "SELECT json_extract(value,'$.a[0]') AS n FROM game_settings")[0]['n'], 1)
-            self.assertEqual(len(query(db, 'SELECT * FROM gameweeks')), 3)
-            self.assertEqual(coverage, [])
-            for sql in ('SELECT * FROM metadata', "SELECT readfile('/etc/passwd')"):
-                with self.assertRaises(sqlite3.Error):
-                    query(db, sql)
-        finally:
-            db.close()
 
     async def test_existing_database_migrates_and_reopens(self):
         await self.db.execute("INSERT INTO players VALUES (500,'Historical')")

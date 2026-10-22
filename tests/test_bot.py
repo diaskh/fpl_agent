@@ -4,6 +4,7 @@ import json
 import tempfile
 import sqlite3
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -14,7 +15,7 @@ from telegram.error import Forbidden, TimedOut
 from bot import Config, Service, graph_command, race_command, report_command
 from charts import chart_spec
 from race import race_spec
-from data import FPL, Store, calculate, completed_fixture_groups, connect, historical_ranks, latest_completed, month_phase, rows
+from data import FPL, Store, calculate, due_fixture_groups, connect, historical_ranks, latest_completed, month_phase, rows
 from formatting import blocks, escaped, format_messages, render
 
 
@@ -71,7 +72,7 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
                                        "event_transfers_cost": 4, "event_transfers": 1}
         await self.store.ensure_through(3, self.bootstrap)
 
-    async def test_live_scores_and_question_snapshot(self):
+    async def test_live_scores_and_provisional_status(self):
         await self.make_live()
         stats = await calculate(self.db, 3)
         self.assertTrue(stats["provisional"])
@@ -79,13 +80,9 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
         totals = await rows(self.db, "SELECT total_points FROM standings WHERE gw_id=3 ORDER BY entry_id")
         self.assertEqual([r["total_points"] for r in totals], [86, 101])
         self.assertIn("Предварительно", blocks(stats)[0]["GW_TITLE"])
-        from questions import snapshot, query
-        db, _, coverage = await snapshot(SimpleNamespace(db=self.db, lock=asyncio.Lock()))
-        try:
-            self.assertEqual(coverage[-1]["provisional"], 1)
-            self.assertEqual(len(query(db, "SELECT * FROM picks WHERE gw_id=3")), 30)
-        finally:
-            db.close()
+        status = await rows(self.db, "SELECT provisional FROM result_status WHERE gw_id=3")
+        self.assertEqual(status[0]["provisional"], 1)
+        self.assertEqual(len(await rows(self.db, "SELECT * FROM picks WHERE gw_id=3")), 30)
 
     async def test_fixture_snapshot_stores_scores_and_status(self):
         await self.store.sync_bootstrap(self.bootstrap)
@@ -143,12 +140,34 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["best_captain"][0]["points"], 15)
         self.assertEqual(stats["highest_climb"][0]["entry_id"], 2)
         self.assertEqual(stats["highest_drop"][0]["movement"], 1)
-        self.assertEqual(stats["manager_of_month"]["points"], 90)
-        self.assertEqual(stats["season_bench_warmer"]["points"], 8)
-        self.assertEqual(stats["season_best_captain"]["points"], 30)
+        self.assertEqual(stats["manager_of_month"][0]["points"], 90)
+        self.assertEqual(stats["season_bench_warmer"][0]["points"], 8)
+        self.assertEqual(stats["season_best_captain"][0]["points"], 30)
         first = await calculate(self.db, 1)
         self.assertEqual(first["highest_climb"], [])
-        self.assertEqual(first["manager_of_month"]["points"], 60)
+        self.assertEqual(first["manager_of_month"][0]["points"], 60)
+
+    async def test_cumulative_sections_show_three_ranked_managers(self):
+        # Four tied managers exercise the top-three cutoff and stable tie order.
+        self.members[:] = [{"entry": e, "entry_name": f"Team {e}", "player_name": f"Manager {e}"}
+                           for e in (4, 3, 2, 1)]
+        for entry in (2, 3, 4):
+            self.histories[entry] = copy.deepcopy(self.histories[1])
+        await self.seed()
+        await self.db.execute("UPDATE picks SET multiplier=2 WHERE element_id=1")
+        await self.db.commit()
+        stats = await calculate(self.db, 2)
+        sections = blocks(stats)[1]
+        for key, block in (("manager_of_month", "MONTH"),
+                           ("season_bench_warmer", "SEASON_BENCH"),
+                           ("season_best_captain", "SEASON_CAPTAIN")):
+            self.assertEqual([r["entry_id"] for r in stats[key]], [1, 2, 3])
+            for place, entry in enumerate((1, 2, 3), 1):
+                self.assertIn(f"{place}. Team {entry} (Manager {entry})", sections[block])
+            self.assertNotIn("Team 4", sections[block])
+        messages = await format_messages(None, stats)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("Team 3", messages[1])
 
     async def test_bench_boost_points_are_not_unused_bench_points(self):
         await self.seed()
@@ -156,15 +175,8 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
         await self.db.commit()
         stats = await calculate(self.db, 2)
         self.assertEqual([(r["entry_id"], r["points"]) for r in stats["bench_warmers"]], [(2, 4), (1, 0)])
-        self.assertEqual(stats["season_bench_warmer"]["entry_id"], 2)
-        self.assertEqual(stats["season_bench_warmer"]["points"], 8)
-        from questions import snapshot, query
-        service = SimpleNamespace(db=self.db, lock=asyncio.Lock())
-        db, _, _ = await snapshot(service)
-        try:
-            self.assertEqual(query(db, "SELECT SUM(points) AS points FROM bench_scores WHERE entry_id=1")[0]["points"], 4)
-        finally:
-            db.close()
+        self.assertEqual(stats["season_bench_warmer"][0]["entry_id"], 2)
+        self.assertEqual(stats["season_bench_warmer"][0]["points"], 8)
 
     async def test_top_ten_and_all_weekly_award_ties(self):
         await self.seed()
@@ -205,7 +217,7 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
         self.live["elements"] = []
         with self.assertRaises(ValueError):
             await self.store.sync_gameweek(2)
-        self.assertEqual((await calculate(self.db, 2))["season_best_captain"]["points"], 30)
+        self.assertEqual((await calculate(self.db, 2))["season_best_captain"][0]["points"], 30)
 
     async def test_incomplete_cumulative_data_rejected(self):
         await self.store.sync_gameweek(2)
@@ -265,10 +277,10 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
         self.live["elements"].append({"id": 999, "stats": {"total_points": 9}})
         with self.assertRaises(sqlite3.IntegrityError):
             await self.store.sync_gameweek(2)
-        self.assertEqual((await calculate(self.db, 2))["season_best_captain"]["points"], 30)
+        self.assertEqual((await calculate(self.db, 2))["season_best_captain"][0]["points"], 30)
         self.assertEqual((await rows(self.db, "SELECT COUNT(*) AS n FROM picks"))[0]["n"], 60)
 
-    async def test_poll_sends_only_after_entire_kickoff_group_finishes(self):
+    async def test_poll_sends_two_hours_after_kickoff_regardless_of_status(self):
         service = Service(Config("", -100, 1, 836115, "", ""), self.db, self.fpl, None)
         self.bootstrap["events"][2].update(finished=False, data_checked=False, is_current=True)
         self.picks["entry_history"] = {"event": 3, "points": 6, "total_points": 86,
@@ -286,13 +298,16 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
         service.store.fpl = self.fpl
         service.broadcast_fixture_group = AsyncMock()
         # First poll establishes a baseline and does not replay completed groups.
-        await service.poll(None)
-        service.broadcast_fixture_group.assert_not_awaited()
-        fixtures[1]["finished"] = True
-        await service.poll(None)
-        service.broadcast_fixture_group.assert_not_awaited()
-        fixtures[2]["finished"] = True
-        await service.poll(None)
+        with patch("bot.due_fixture_groups", side_effect=lambda games: due_fixture_groups(
+                games, datetime(2026, 9, 19, 20, 59, 59, tzinfo=timezone.utc))):
+            await service.poll(None)
+            service.broadcast_fixture_group.assert_not_awaited()
+            fixtures[1]["finished"] = True
+            await service.poll(None)
+            service.broadcast_fixture_group.assert_not_awaited()
+        with patch("bot.due_fixture_groups", side_effect=lambda games: due_fixture_groups(
+                games, datetime(2026, 9, 19, 21, 0, tzinfo=timezone.utc))):
+            await service.poll(None)
         service.broadcast_fixture_group.assert_awaited_once_with(None, 3, "2026-09-19T19:00:00Z", self.bootstrap)
 
     async def test_membership_change_invalidates_later_snapshots(self):
@@ -316,12 +331,13 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
         message = SimpleNamespace(reply_text=AsyncMock(), reply_photo=AsyncMock())
         update = SimpleNamespace(effective_user=SimpleNamespace(id=2, is_bot=False),
                                  effective_chat=SimpleNamespace(id=-100), effective_message=message)
-        context = SimpleNamespace(application=SimpleNamespace(bot_data={"service": service}), args=["latest"])
-        with patch("bot.render_chart", return_value=SimpleNamespace(name="chart.png")):
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"service": service}), args=[])
+        self.fpl.members.return_value = [dict(m, total=163-i, event_total=999) for i,m in enumerate(self.members)]
+        with patch("bot.render_density", return_value=SimpleNamespace(name="chart.png")) as renderer:
             await graph_command(update, context)
-        self.assertEqual(message.reply_photo.await_count, 2)
-        self.assertIn("Топ-10", message.reply_photo.call_args_list[0].kwargs["caption"])
-        self.assertIn("Вся мини-лига", message.reply_photo.call_args_list[1].kwargs["caption"])
+        self.assertEqual(message.reply_photo.await_count, 1)
+        self.assertEqual(renderer.call_args.args[0], [163, 162])
+        self.assertIn("общей таблицы", message.reply_photo.call_args.kwargs["caption"])
 
     async def test_chart_spec_supports_top_ten_and_all_scopes(self):
         await self.store.ensure_through(3, self.bootstrap)
@@ -371,11 +387,18 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PureTests(unittest.TestCase):
-    def test_completed_fixture_groups_require_every_simultaneous_match(self):
-        fixtures = [{"kickoff_time": "2026-09-19T16:30:00Z", "finished": True},
+    def test_due_fixture_groups_use_time_and_ignore_status(self):
+        fixtures = [{"kickoff_time": "2026-09-19T16:30:00Z", "finished": False},
                     {"kickoff_time": "2026-09-19T19:00:00Z", "finished": True},
-                    {"kickoff_time": "2026-09-19T19:00:00Z", "finished": False}]
-        self.assertEqual(completed_fixture_groups(fixtures), ["2026-09-19T16:30:00Z"])
+                    {"kickoff_time": "2026-09-19T19:00:00Z", "finished": False},
+                    {"kickoff_time": None, "finished": True}]
+        before = datetime(2026, 9, 19, 20, 59, 59, tzinfo=timezone.utc)
+        boundary = datetime(2026, 9, 19, 21, 0, tzinfo=timezone.utc)
+        self.assertEqual(due_fixture_groups(fixtures, before), ["2026-09-19T16:30:00Z"])
+        self.assertEqual(due_fixture_groups(fixtures, boundary),
+                         ["2026-09-19T16:30:00Z", "2026-09-19T19:00:00Z"])
+        self.assertEqual(due_fixture_groups([], boundary), [])
+
     def test_transfer_tiebreak(self):
         history = {1: [{"event": 1, "total_points": 50, "rank_transfers": 2}],
                    2: [{"event": 1, "total_points": 50, "rank_transfers": 0}],
@@ -402,6 +425,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
             calls.append(request)
             if len(calls) == 1:
                 return httpx.Response(503)
+            self.assertEqual(request.url.params["phase"], "1")
             page = int(request.url.params["page_standings"])
             return httpx.Response(200, json={"league": {"start_event": 1}, "standings": {"results": [{"entry": page}], "has_next": page == 1}})
         fpl.client = httpx.AsyncClient(base_url="https://example.test/", transport=httpx.MockTransport(handler))

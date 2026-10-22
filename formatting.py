@@ -10,7 +10,7 @@ SYSTEM_PROMPT = '''You are a professional yet witty sports commentator for a Tel
 **CRITICAL LANGUAGE INSTRUCTION:**
 
 **Message 1 (Russian) content:** Gameweek Recap (Top 10 Scorers, Top 5 Bench Warmers, Best Captain, Highest Climb/Drop).
-**Message 2 (Russian) content:** Cumulative Stats (Manager of the Month, Season Bench Warmer, Season Best Captain).
+**Message 2 (Russian) content:** Cumulative Stats (Top 3 Managers of the Month, Top 3 Season Bench Warmers, Top 3 Season Captains).
 Output the result strictly as a valid JSON array containing exactly two string elements: ["<message 1 in Russian>", "<message 2 in Russian>"].'''
 
 
@@ -50,9 +50,9 @@ def blocks(stats):
          "CLIMB": "📈 Самый большой подъём\n" + ("\n".join(movement(row) for row in stats["highest_climb"]) or "Нет"),
          "DROP": "📉 Самое большое падение\n" + ("\n".join(movement(row) for row in stats["highest_drop"]) or "Нет")},
         {"SEASON_TITLE": f'📊 Итоги сезона · по тур {stats["gameweek"]} включительно' + live_note,
-         "MONTH": f'🏆 Лидер месяца: {month} (туры {phase["start_event"]}–{stats["gameweek"]})\n' + score(stats["manager_of_month"], "очк.", "Нет данных"),
-         "SEASON_BENCH": "🪑 Лидер сезона по очкам на скамейке\n" + score(stats["season_bench_warmer"], "очк.", "Нет данных"),
-         "SEASON_CAPTAIN": "🎯 Лидер сезона по очкам капитана\n" + score(stats["season_best_captain"], "очк.", "Нет данных")}
+         "MONTH": f'🏆 Топ-3 месяца: {month} (туры {phase["start_event"]}–{stats["gameweek"]})\n' + table(stats["manager_of_month"]),
+         "SEASON_BENCH": "🪑 Топ-3 сезона по очкам на скамейке\n" + table(stats["season_bench_warmer"]),
+         "SEASON_CAPTAIN": "🎯 Топ-3 сезона по очкам капитана\n" + table(stats["season_best_captain"])}
     ]
 
 

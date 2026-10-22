@@ -49,3 +49,8 @@ CREATE TABLE IF NOT EXISTS fixtures (
  finished INTEGER NOT NULL, finished_provisional INTEGER NOT NULL, minutes INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS fixtures_event ON fixtures(event);
+
+-- Durable post-deadline messages; independent of points reports.
+CREATE TABLE IF NOT EXISTS deadline_reports (
+ gw_id INTEGER PRIMARY KEY, messages TEXT NOT NULL,
+ sent_count INTEGER NOT NULL DEFAULT 0 CHECK(sent_count>=0));

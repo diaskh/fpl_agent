@@ -9,6 +9,7 @@ User=fplbot
 Group=fplbot
 WorkingDirectory=/opt/fpl-bot
 EnvironmentFile=/opt/fpl-bot/.env
+Environment=FPL_ENV=production
 Environment=PYTHONUNBUFFERED=1
 Environment=DATABASE_PATH=/var/lib/fpl-bot/fpl_data.db
 ExecStart=/opt/fpl-bot/.venv/bin/python /opt/fpl-bot/bot.py run

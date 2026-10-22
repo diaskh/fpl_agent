@@ -1,7 +1,7 @@
 """FPL ingestion and deterministic metrics. One database per league and season."""
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
@@ -32,7 +32,7 @@ class FPL:
     async def members(self, league_id):
         result = {}
         for page in range(1, 10001):
-            payload = await self.get(f"leagues-classic/{league_id}/standings/", page_standings=page)
+            payload = await self.get(f"leagues-classic/{league_id}/standings/", page_standings=page, phase=1)
             if payload["league"].get("start_event", 1) != 1:
                 raise ValueError("Only classic leagues starting at GW1 are supported")
             standings = payload["standings"]
@@ -71,15 +71,13 @@ def latest_available(bootstrap):
                 (e.get("is_current") and datetime.fromisoformat(e["deadline_time"].replace("Z", "+00:00")) <= now)), default=None)
 
 
-def completed_fixture_groups(fixtures):
-    """Return kickoff timestamps whose entire simultaneous fixture group is finished."""
-    groups = {}
-    for fixture in fixtures:
-        kickoff = fixture.get("kickoff_time")
-        if kickoff:
-            groups.setdefault(kickoff, []).append(fixture)
-    return [kickoff for kickoff, games in sorted(groups.items())
-            if games and all(game.get("finished") is True for game in games)]
+def due_fixture_groups(fixtures, now=None):
+    """Return unique kickoff groups at least two hours old, regardless of status."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    kickoffs = {f["kickoff_time"] for f in fixtures if f.get("kickoff_time")}
+    return [kickoff for kickoff in sorted(kickoffs)
+            if datetime.fromisoformat(kickoff.replace("Z", "+00:00")) + timedelta(hours=2) <= now]
 
 
 def month_phase(phases, gw):
@@ -115,7 +113,7 @@ class Store:
         await save_bootstrap(self.db, bootstrap, self.league_id)
 
     async def sync_fixtures(self, fixtures):
-        """Replace the fixture snapshot used by /ask with validated official data."""
+        """Replace the fixture snapshot with validated official data."""
         fields = ('id', 'event', 'kickoff_time', 'team_h', 'team_a', 'team_h_score',
                   'team_a_score', 'started', 'finished', 'finished_provisional', 'minutes')
         if not isinstance(fixtures, list):
@@ -265,9 +263,6 @@ async def calculate(db, gw):
     phase = month_phase(phases, gw)
     async def query(sql, params=()):
         return await rows(db, sql, params)
-    async def first(sql, params=()):
-        result = await query(sql, params)
-        return result[0] if result else None
     names = "m.entry_id,m.entry_name,m.player_name"
     top = await query(f"SELECT {names},s.event_points AS points FROM standings s JOIN managers m USING(entry_id) WHERE gw_id=? ORDER BY points DESC,entry_id LIMIT 10", (gw,))
     bench = await query(f"WITH b AS ({BENCH}) SELECT {names},b.points FROM b JOIN managers m USING(entry_id) WHERE gw_id=? ORDER BY points DESC,entry_id LIMIT 5", (gw,))
@@ -280,9 +275,9 @@ async def calculate(db, gw):
     drop = await leaders(movement + " AND last_rank<rank", "movement", descending=False)
     for row in drop:
         row["movement"] = abs(row["movement"])
-    month = await first(f"SELECT {names},SUM(s.event_points) AS points FROM standings s JOIN managers m USING(entry_id) WHERE gw_id BETWEEN ? AND ? GROUP BY m.entry_id ORDER BY points DESC,m.entry_id LIMIT 1", (phase["start_event"], min(gw, phase["stop_event"])))
+    month = await query(f"SELECT {names},SUM(s.event_points) AS points FROM standings s JOIN managers m USING(entry_id) WHERE gw_id BETWEEN ? AND ? GROUP BY m.entry_id ORDER BY points DESC,m.entry_id LIMIT 3", (phase["start_event"], min(gw, phase["stop_event"])))
     async def cumulative(metric):
-        return await first(f"WITH b AS ({metric}) SELECT {names},SUM(b.points) AS points FROM b JOIN managers m USING(entry_id) WHERE gw_id<=? GROUP BY m.entry_id ORDER BY points DESC,m.entry_id LIMIT 1", (gw,))
+        return await query(f"WITH b AS ({metric}) SELECT {names},SUM(b.points) AS points FROM b JOIN managers m USING(entry_id) WHERE gw_id<=? GROUP BY m.entry_id ORDER BY points DESC,m.entry_id LIMIT 3", (gw,))
     status = await rows(db, "SELECT provisional,synced_at FROM sync_runs LEFT JOIN result_status USING(gw_id) WHERE gw_id=?", (gw,))
     return {"provisional": bool(status[0]["provisional"]), "synced_at": status[0]["synced_at"], "gameweek": gw, "top_scorers": top, "bench_warmers": bench, "best_captain": captain,
             "highest_climb": climb, "highest_drop": drop, "month_phase": phase,

@@ -6,25 +6,24 @@ import fcntl
 import json
 import logging
 import os
-import re
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 from openai import AsyncOpenAI
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, RetryAfter
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler
 
-from data import FPL, Store, calculate, completed_fixture_groups, connect, latest_completed, latest_available, rows
+from data import FPL, Store, calculate, due_fixture_groups, connect, latest_completed, latest_available, rows
 from formatting import format_messages
-from questions import answer, error_text
 from charts import chart_spec, render_chart
 from race import race_spec, render_race
+from density import render_density
+from deadline import build_messages, passed_deadlines
 
 LOG = logging.getLogger(__name__)
 
@@ -40,16 +39,21 @@ class Config:
 
     @classmethod
     def load(cls, require_secrets=True):
-        load_dotenv(Path(__file__).with_name(".env"))
+        environment = os.getenv("FPL_ENV", "local")
+        if environment not in ("local", "production"):
+            raise ValueError("FPL_ENV must be local or production")
+        filename = ".env.local" if environment == "local" else ".env"
+        values = {**dotenv_values(Path(__file__).with_name(filename)), **os.environ}
         required = ["FPL_LEAGUE_ID"]
         if require_secrets:
             required += ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "ADMIN_TELEGRAM_ID", "OPENAI_API_KEY"]
-        missing = [k for k in required if not os.getenv(k)]
+        missing = [k for k in required if not values.get(k)]
         if missing:
-            raise ValueError("Missing environment variables: " + ", ".join(missing))
-        result = cls(os.getenv("TELEGRAM_BOT_TOKEN", ""), int(os.getenv("TELEGRAM_CHAT_ID") or 0),
-                     int(os.getenv("ADMIN_TELEGRAM_ID") or 0), int(os.environ["FPL_LEAGUE_ID"]),
-                     os.getenv("OPENAI_API_KEY", ""), os.getenv("DATABASE_PATH", "fpl_data.db"))
+            raise ValueError(f"Missing environment variables in {filename} ({environment}): " + ", ".join(missing))
+        default_database = "fpl_local.db" if environment == "local" else "fpl_data.db"
+        result = cls(values.get("TELEGRAM_BOT_TOKEN", ""), int(values.get("TELEGRAM_CHAT_ID") or 0),
+                     int(values.get("ADMIN_TELEGRAM_ID") or 0), int(values["FPL_LEAGUE_ID"]),
+                     values.get("OPENAI_API_KEY", ""), values.get("DATABASE_PATH") or default_database)
         if result.league_id <= 0 or (require_secrets and (result.admin_id <= 0 or result.chat_id == 0)):
             raise ValueError("Invalid league/admin/chat ID")
         return result
@@ -60,8 +64,6 @@ class Service:
         self.config, self.db, self.fpl, self.llm = config, db, fpl, llm
         self.store = Store(db, fpl, config.league_id)
         self.lock = asyncio.Lock()
-        self.question_lock = asyncio.Lock()
-        self.question_times = {}
 
     async def set_metadata(self, key, value):
         await self.db.execute("INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
@@ -106,7 +108,7 @@ class Service:
         return True
 
     async def broadcast_fixture_group(self, bot, gw, kickoff, bootstrap):
-        """Send one cumulative live report after every match at kickoff has finished."""
+        """Send one cumulative live report two hours after the group kickoff."""
         pending = await rows(self.db, "SELECT * FROM fixture_reports WHERE gw_id=? AND kickoff_time=?", (gw, kickoff))
         marker = f"sending-fixture:{gw}:{kickoff}"
         ambiguous = await rows(self.db, "SELECT value FROM metadata WHERE key=?", (marker,))
@@ -142,12 +144,50 @@ class Service:
             await self.db.commit()
         return True
 
+    async def poll_deadlines(self, bot, bootstrap):
+        passed = passed_deadlines(bootstrap)
+        baseline = await rows(self.db, "SELECT value FROM metadata WHERE key='deadline-baseline'")
+        if not baseline:
+            # Do not replay old deadlines when the feature is first installed.
+            await self.set_metadata("deadline-baseline", json.dumps(passed))
+            return
+        skipped = set(json.loads(baseline[0]["value"]))
+        for gw in passed:
+            if gw in skipped:
+                continue
+            pending = await rows(self.db, "SELECT * FROM deadline_reports WHERE gw_id=?", (gw,))
+            marker = f"sending-deadline:{gw}"
+            if await rows(self.db, "SELECT value FROM metadata WHERE key=?", (marker,)):
+                LOG.error("GW%s deadline delivery uncertain; inspect chat and saved deadline_reports before resolving metadata", gw)
+                continue
+            if not pending:
+                messages = await build_messages(self.fpl, self.config.league_id, gw, bootstrap)
+                await self.db.execute("INSERT INTO deadline_reports(gw_id,messages) VALUES (?,?)",
+                                      (gw, json.dumps(messages, ensure_ascii=False)))
+                await self.db.commit()
+                count = 0
+            else:
+                messages = json.loads(pending[0]["messages"])
+                count = pending[0]["sent_count"]
+            for index in range(count, len(messages)):
+                await self.set_metadata(marker, str(index))
+                try:
+                    await bot.send_message(chat_id=self.config.chat_id, text=messages[index])
+                except (BadRequest, Forbidden, RetryAfter):
+                    await self.db.execute("DELETE FROM metadata WHERE key=?", (marker,))
+                    await self.db.commit()
+                    raise
+                await self.db.execute("UPDATE deadline_reports SET sent_count=? WHERE gw_id=?", (index + 1, gw))
+                await self.db.execute("DELETE FROM metadata WHERE key=?", (marker,))
+                await self.db.commit()
+
     async def poll(self, bot):
         if self.lock.locked():
             return
         async with self.lock:
             try:
                 bootstrap = await self.fpl.get("bootstrap-static/")
+                await self.poll_deadlines(bot, bootstrap)
                 await self.store.sync_bootstrap(bootstrap)
                 fixtures = await self.fpl.get("fixtures/")
                 await self.store.sync_fixtures(fixtures)
@@ -157,18 +197,18 @@ class Service:
                 # Keep the live snapshot fresh even while the current fixture group is playing.
                 await self.store.ensure_through(available, bootstrap)
                 current_fixtures = [f for f in fixtures if f.get("event") == available]
-                completed = completed_fixture_groups(current_fixtures)
+                due = due_fixture_groups(current_fixtures)
                 baseline_key = f"fixture-baseline:{available}"
                 baseline = await rows(self.db, "SELECT value FROM metadata WHERE key=?", (baseline_key,))
                 if not baseline:
-                    # A new deployment never floods the chat with already completed groups.
-                    await self.set_metadata(baseline_key, json.dumps(completed))
-                    baseline_groups = set(completed)
+                    # A new deployment never floods the chat with already due groups.
+                    await self.set_metadata(baseline_key, json.dumps(due))
+                    baseline_groups = set(due)
                 else:
                     baseline_groups = set(json.loads(baseline[0]["value"]))
                 delivered = {r["kickoff_time"] for r in await rows(
                     self.db, "SELECT kickoff_time FROM fixture_reports WHERE gw_id=? AND sent_count=2", (available,))}
-                for kickoff in completed:
+                for kickoff in due:
                     if kickoff not in baseline_groups and kickoff not in delivered:
                         await self.broadcast_fixture_group(bot, available, kickoff, bootstrap)
             except Exception as exc:
@@ -220,8 +260,41 @@ async def report_command(update, context):
             await message.reply_text("Не удалось отправить отчёт. Проверьте журнал сервиса и состояние отправки; при неопределённом статусе используйте команду resolve в CLI.")
 
 
-async def ask_command(update, context):
-    await question_message(update, context, command=True)
+async def transfers_command(update, context):
+    """Admin preview of a past deadline report in the configured Telegram chat."""
+    service = context.application.bot_data["service"]
+    if update.effective_user is None or update.effective_user.id != service.config.admin_id:
+        return
+    message = update.effective_message
+    if not message:
+        return
+    try:
+        if len(context.args) > 1:
+            raise ValueError()
+        gw = int(context.args[0]) if context.args else None
+        if gw is not None and not 1 <= gw <= 38:
+            raise ValueError()
+    except ValueError:
+        await message.reply_text("Использование: /transfers [1–38]")
+        return
+    if service.lock.locked():
+        await message.reply_text("Данные уже обновляются. Попробуйте ещё раз через минуту.")
+        return
+    async with service.lock:
+        try:
+            bootstrap = await service.fpl.get("bootstrap-static/")
+            gw = gw if gw is not None else latest_completed(bootstrap)
+            if gw is None or gw not in passed_deadlines(bootstrap):
+                await message.reply_text("Выберите тур, дедлайн которого уже прошёл.")
+                return
+            messages = await build_messages(service.fpl, service.config.league_id, gw, bootstrap)
+            for text in messages:
+                await context.bot.send_message(chat_id=service.config.chat_id, text=text)
+            if update.effective_chat and update.effective_chat.id != service.config.chat_id:
+                await message.reply_text(f"Трансферы за GW{gw} отправлены в настроенный чат.")
+        except Exception as exc:
+            LOG.error("Transfer preview failed (%s)", type(exc).__name__)
+            await message.reply_text("Не удалось отправить трансферы. Данные FPL могут обновляться; попробуйте позже.")
 
 
 async def graph_command(update, context):
@@ -231,11 +304,11 @@ async def graph_command(update, context):
     if not message or not user or user.is_bot or not chat or chat.id != service.config.chat_id:
         return
     if len(context.args) > 1:
-        await message.reply_text("Использование: /graph [latest|history]")
+        await message.reply_text("Использование: /graph [density|history]")
         return
-    choice = context.args[0].lower() if context.args else "latest"
-    if choice not in ("latest", "history"):
-        await message.reply_text("Использование: /graph [latest|history]")
+    choice = context.args[0].lower() if context.args else "density"
+    if choice not in ("density", "latest", "history"):
+        await message.reply_text("Использование: /graph [density|history]")
         return
     if service.lock.locked():
         await message.reply_text("Данные уже обновляются. Попробуйте ещё раз через минуту.")
@@ -249,6 +322,21 @@ async def graph_command(update, context):
             gw = current
             if gw is None:
                 await message.reply_text("Для этого тура ещё нет доступных данных.")
+                return
+            if choice in ("density", "latest"):
+                # Official Overall (phase 1) table: cumulative total, never event_total.
+                members = await service.fpl.members(service.config.league_id)
+                totals = [m["total"] for m in members]
+                if not totals:
+                    await message.reply_text("В общей таблице пока нет команд.")
+                    return
+                if any(type(v) is not int for v in totals):
+                    raise ValueError("Invalid overall standings total")
+                synced_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+                event = next(e for e in bootstrap["events"] if e["id"] == gw)
+                provisional = not event.get("data_checked", False)
+                photo = await asyncio.to_thread(render_density, totals, synced_at, provisional)
+                await message.reply_photo(photo=photo, caption="Плотность общей таблицы мини-лиги · суммарные очки за сезон.")
                 return
             await service.store.ensure_through(gw, bootstrap)
             specs = [await chart_spec(service.db, gw, choice, scope) for scope in ("top10", "all")]
@@ -296,66 +384,6 @@ async def race_command(update, context):
         await message.reply_text("Не удалось создать гонку. Проверьте bar-chart-race и FFmpeg в окружении бота.")
 
 
-def split_answer(text, limit=4000, max_messages=3):
-    """Split plain-text /ask output at natural boundaries within Telegram limits."""
-    parts = []
-    remaining = text.strip()
-    while remaining:
-        if len(parts) == max_messages - 1:
-            if len(remaining) > limit:
-                raise ValueError("Answer exceeds Telegram message budget")
-            parts.append(remaining)
-            break
-        if len(remaining) <= limit:
-            parts.append(remaining)
-            break
-        window = remaining[:limit + 1]
-        candidates = [window.rfind(boundary, 0, limit + 1)
-                      for boundary in ('\n\n', '\n', '. ', '! ', '? ', ' ')]
-        cut = max((position for position in candidates if position >= limit // 2), default=limit)
-        if window[cut:cut + 2] in ('. ', '! ', '? '):
-            cut += 1
-        part = remaining[:cut].rstrip()
-        if not part:
-            part, cut = remaining[:limit], limit
-        parts.append(part)
-        remaining = remaining[cut:].lstrip()
-    return parts
-
-
-async def question_message(update, context, command=False):
-    service = context.application.bot_data["service"]
-    message, user, chat = update.effective_message, update.effective_user, update.effective_chat
-    if not message or not user or user.is_bot or not chat or chat.id != service.config.chat_id:
-        return
-    text = message.text or ""
-    replied = message.reply_to_message
-    replying = bool(replied and replied.from_user and replied.from_user.id == context.bot.id)
-    mention = re.compile(r"@" + re.escape(context.bot.username) + r"\b", re.IGNORECASE)
-    if not command and not replying and not mention.search(text):
-        return
-    question = text.split(maxsplit=1)[1] if command and len(text.split(maxsplit=1)) > 1 else ("" if command else mention.sub("", text).strip())
-    if not question:
-        await message.reply_text("После /ask напишите вопрос.")
-        return
-    if len(question) > 1500:
-        await message.reply_text(error_text('length', question))
-        return
-    now = time.monotonic()
-    service.question_times = {uid: t for uid, t in service.question_times.items() if now - t < 10}
-    if user.id in service.question_times:
-        await message.reply_text(error_text('cooldown', question))
-        return
-    if service.question_lock.locked() or service.lock.locked():
-        await message.reply_text(error_text('busy', question))
-        return
-    service.question_times[user.id] = now
-    async with service.question_lock:
-        result = await answer(service, question, (replied.text or "")[:2500] if replying else "")
-        for part in split_answer(result):
-            await message.reply_text(part, parse_mode=None)
-
-
 async def post_init(app):
     config = app.bot_data["config"]
     db = await connect(config.database)
@@ -384,6 +412,24 @@ async def post_shutdown(app):
         await service.llm.close()
         await service.fpl.client.aclose()
         await service.db.close()
+
+
+async def deadline_preview(config, gw=None):
+    """Print real deadline messages without Telegram or database access."""
+    fpl = FPL()
+    try:
+        bootstrap = await fpl.get("bootstrap-static/")
+        gw = gw if gw is not None else latest_completed(bootstrap)
+        if gw is None or gw not in passed_deadlines(bootstrap):
+            raise ValueError("Choose a gameweek whose deadline has passed")
+        event = next(e for e in bootstrap["events"] if e["id"] == gw)
+        messages = await build_messages(fpl, config.league_id, gw, bootstrap)
+        print(f"GW{gw} deadline: {event['deadline_time']} (UTC). Deadline passed.")
+        print("Preview only: no Telegram messages sent; no database changes.")
+        for index, message in enumerate(messages, 1):
+            print(f"\n--- Message {index}/{len(messages)} ---\n{message}")
+    finally:
+        await fpl.client.aclose()
 
 
 async def cli(args, config):
@@ -430,6 +476,8 @@ def main():
     sub.add_parser("status")
     preview = sub.add_parser("preview")
     preview.add_argument("gw", type=int, choices=range(1, 39))
+    deadline = sub.add_parser("deadline-preview", help="Print the post-deadline transfer report without sending")
+    deadline.add_argument("gw", nargs="?", type=int, choices=range(1, 39), help="Default: latest completed gameweek")
     resolve = sub.add_parser("resolve")
     resolve.add_argument("gw", type=int, choices=range(1, 39))
     resolve.add_argument("count", type=int, choices=range(3), help="Messages visibly delivered (0, 1, or 2)")
@@ -439,6 +487,9 @@ def main():
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     config = Config.load(require_secrets=args.command == "run")
+    if args.command == "deadline-preview":
+        asyncio.run(deadline_preview(config, args.gw))
+        return
     # VPS/Linux and macOS: hold an advisory lock for the full process lifetime.
     with open(config.database + ".lock", "a") as process_lock:
         try:
@@ -452,10 +503,9 @@ def main():
                .post_stop(post_stop).post_shutdown(post_shutdown).build())
         app.bot_data["config"] = config
         app.add_handler(CommandHandler("report", report_command))
+        app.add_handler(CommandHandler("transfers", transfers_command, block=False))
         app.add_handler(CommandHandler("graph", graph_command, block=False))
         app.add_handler(CommandHandler("race", race_command, block=False))
-        app.add_handler(CommandHandler("ask", ask_command, block=False))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, question_message, block=False))
         app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
 
 
