@@ -28,6 +28,12 @@ Only `ADMIN_TELEGRAM_ID` can use `/report` or `/report 2`. Other users are silen
 
 ## Charts in the group
 
+All chart and cup renderers share the `/graph form` editorial style: warm ivory,
+Oswald headlines, Inter labels, a restrained teal/blue/ochre/plum palette, subtle
+rules and soft tinted regions or cards. History charts use numbered endpoints
+and a separate team key. The race video uses the same bundled fonts and colours.
+Styling does not change score calculations, cup progression or chart commands.
+
 Every group member can use `/graph` (or `/graph density`) to request a Russian
 league-density PNG. It uses every team's exact cumulative `total` from freshly fetched
 **Overall standings (phase 1)** across all pages, never gameweek points, monthly totals,
@@ -40,6 +46,18 @@ by no more than the rounded-up median positive gap forms the core; the lower tai
 and the upper tail splits at its largest above-median gap. Without a core of at least
 three distinct totals, only gaps greater than twice the median become boundaries
 (up to four groups). Group descriptions are computed from actual membership.
+
+`/graph form` sends a Russian four-quadrant scatter plot using database standings
+refreshed through the latest available gameweek. X is cumulative season points minus
+the current teams' mean; Y is the sum of event points over the last three gameweeks
+minus the same cohort's mean. Event points are used as stored, without subtracting
+transfer costs again. Both axes cross at zero and show negative and positive values.
+Every team in the current snapshot appears, numbered in season-points order beside
+a team key. Actual dots retain exact coordinates; only number callouts move to avoid
+crowding. The renderer uses the shared Pillow fonts and editorial palette, with the
+sync timestamp and provisional status (if any recent gameweek is provisional).
+At least three gameweeks and complete recent history for every team are required;
+missing scores are never replaced with zero.
 
 `/graph history` retains the two season-long rank charts (top 10 and all managers).
 

@@ -23,6 +23,7 @@ from formatting import format_messages
 from charts import chart_spec, render_chart
 from race import race_spec, render_race
 from density import render_density
+from form import form_spec, render_form
 from deadline import build_messages, passed_deadlines
 from cup import Cup
 
@@ -354,11 +355,11 @@ async def graph_command(update, context):
     if not message or not user or user.is_bot or not chat or chat.id != service.config.chat_id:
         return
     if len(context.args) > 1:
-        await message.reply_text("Использование: /graph [density|history]")
+        await message.reply_text("Использование: /graph [density|history|form]")
         return
     choice = context.args[0].lower() if context.args else "density"
-    if choice not in ("density", "latest", "history"):
-        await message.reply_text("Использование: /graph [density|history]")
+    if choice not in ("density", "latest", "history", "form"):
+        await message.reply_text("Использование: /graph [density|history|form]")
         return
     if service.lock.locked():
         await message.reply_text("Данные уже обновляются. Попробуйте ещё раз через минуту.")
@@ -388,7 +389,20 @@ async def graph_command(update, context):
                 photo = await asyncio.to_thread(render_density, totals, synced_at, provisional)
                 await message.reply_photo(photo=photo, caption="Плотность общей таблицы мини-лиги · суммарные очки за сезон.")
                 return
+            if choice == "form" and gw < 3:
+                await message.reply_text("График формы доступен начиная с третьего тура.")
+                return
             await service.store.ensure_through(gw, bootstrap)
+            if choice == "form":
+                spec = await form_spec(service.db, gw)
+                photo = await asyncio.to_thread(render_form, spec)
+                state = "предварительные данные" if spec["provisional"] else "данные подтверждены FPL"
+                await message.reply_photo(
+                    photo=photo,
+                    caption=f"Сила сезона × текущая форма · GW{gw} · {state}. "
+                            f"X: очки за сезон; Y: туры {gw-2}–{gw}. "
+                            "Обе оси — отклонение от среднего по мини-лиге.")
+                return
             specs = [await chart_spec(service.db, gw, choice, scope) for scope in ("top10", "all")]
             photos = [await asyncio.to_thread(render_chart, spec) for spec in specs]
             state = ("предварительный срез — цифры могут измениться"

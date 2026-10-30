@@ -3,7 +3,7 @@ import io
 import math
 from statistics import median
 from charts import _text
-from visuals import font as _font, headline, tracked_text, PAPER, INK, MUTED, ACCENT, RULE
+from visuals import font as _font, PAPER, INK, MUTED, SERIES, TINTS, chart_header
 
 
 def plural(n, forms):
@@ -103,21 +103,22 @@ def render_density(totals, synced_at, provisional=False):
         _text(draw,(x,y),s,font,color,anchor)
     def x(v):
         return 100+(v-low)/(high-low)*1400
-    tracked_text(draw, (80,55), 'ФЭНТЕЗИ-ФУТБОЛ', heading, ACCENT)
-    text(1520,55,f'ПЛОТНОСТЬ ТАБЛИЦЫ / {teams(len(totals)).upper()}',small,muted,'ra')
     dense = next((g for i,g in enumerate(groups) if 0<i<len(groups)-1 and g['count'] >= len(totals)/2 and g['spread'] > 0),None)
-    headline(draw, (80,135), 'Тесно в середине.' if dense else 'Насколько плотна таблица?', size=88, max_width=1440)
-    text(80,235,f"{teams(dense['count'])} · разброс — {points(dense['spread'])}." if dense else 'Распределение команд по общей сумме очков.',body,muted)
+    state = 'ПРЕДВАРИТЕЛЬНО' if provisional else 'ОБЩАЯ ТАБЛИЦА'
+    chart_header(draw, 1600, f'ELIMAI / МИНИ-ЛИГА FPL / {state}',
+                 'Тесно в середине' if dense else 'Насколько плотна таблица?',
+                 f"{teams(dense['count'])} · разброс — {points(dense['spread'])}" if dense else
+                 'Распределение команд по общей сумме очков', title_size=80)
     centre, axis = 430+extra, 580+2*extra
-    fills = ['#EAE7DF','#E5DECA','#DEE3DB','#E6DBD3']
-    if len(groups)<4:
-        fills = ['#EAE7DF','#DEE3DB','#E6DBD3'] if len(groups)==3 else ['#EAE7DF','#E6DBD3']
+    fills = list(reversed(TINTS[:len(groups)]))
+    colors = list(reversed(SERIES[:len(groups)]))
     for g,fill in zip(groups,fills):
         pad = min(12,1400/(high-low)*step*.12)
-        draw.rounded_rectangle((x(g['low'])-pad,330,x(g['high'])+pad,axis+49),radius=5,fill=fill)
-    for px,offset in coords:
+        draw.rectangle((x(g['low'])-pad,330,x(g['high'])+pad,axis+49),fill=fill)
+    for value,(px,offset) in zip(sorted(totals),coords):
         cy = centre+offset
-        draw.ellipse((px-10,cy-10,px+10,cy+10),fill=ink)
+        color = next(color for g,color in zip(groups,colors) if g['low']<=value<=g['high'])
+        draw.ellipse((px-10,cy-10,px+10,cy+10),fill=color,outline=PAPER,width=2)
     draw.line((100,axis,1500,axis),fill=muted,width=2)
     for tick in range(low, high+1, step):
         draw.line((x(tick),axis,x(tick),axis+9),fill=muted,width=2)
@@ -130,7 +131,7 @@ def render_density(totals, synced_at, provisional=False):
         draw.line((a,bracket_y-8,a,bracket_y,b,bracket_y,b,bracket_y-8),fill=muted,width=2)
         cx=80+col_width*(i+.5)
         draw.line(((a+b)/2,bracket_y+5,cx,bracket_y+35),fill='#C8C5BD',width=1)
-        text(cx,bracket_y+52,g['name'].upper(),heading,ACCENT,'ma')
+        text(cx,bracket_y+52,g['name'].upper(),heading,colors[i],'ma')
         text(cx,bracket_y+94,f"{teams(g['count'])} · {g['low']}–{points(g['high'])}",small,muted,'ma')
         lines = ([f"Всего {points(g['low'])}.", 'Команды идут вровень.'] if g['spread']==0 and g['count']>1 else
                  ['Одна команда в этой зоне.'] if g['count']==1 else

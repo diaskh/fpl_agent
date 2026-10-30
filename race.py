@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 from data import rows
+from visuals import PAPER, INK, MUTED, SERIES, FONTS
 
 
 async def race_spec(db, gw: int) -> dict:
@@ -100,18 +101,27 @@ def render_race(spec: dict) -> io.BytesIO:
         staged_labels.append(frame.index[position])
     frame = pd.DataFrame(staged_rows, index=staged_labels)
 
-    paper, ink, red = "#F3F0E9", "#171717", "#D71920"
-    fig, ax = plt.subplots(figsize=(14, 10), dpi=100)
-    fig.patch.set_facecolor(paper)
-    ax.set_facecolor(paper)
-    ax.tick_params(colors=ink)
+    from matplotlib import font_manager
+    from matplotlib.colors import ListedColormap
+    for filename in ('Inter.ttf', 'Oswald.ttf'):
+        font_manager.fontManager.addfont(str(FONTS / filename))
+    fig, ax = plt.subplots(figsize=(16, 11), dpi=100)
+    fig.subplots_adjust(left=.24, right=.94, top=.76, bottom=.12)
+    fig.patch.set_facecolor(PAPER)
+    ax.set_facecolor(PAPER)
+    ax.tick_params(colors=MUTED)
     for spine in ax.spines.values():
         spine.set_visible(False)
-    title = "Elimai League — cumulative points race"
-    if spec["provisional"]:
-        title += " (provisional)"
-    ax.set_title(title, color=ink, fontweight="bold", loc="left", pad=18)
-    ax.set_xlabel("Total FPL points", color=ink)
+    state = 'ПРЕДВАРИТЕЛЬНО' if spec['provisional'] else 'ИТОГОВЫЕ ДАННЫЕ'
+    fig.text(.06, .95, f"ELIMAI / МИНИ-ЛИГА FPL / {state}",
+             fontfamily='Inter', fontsize=12, color=MUTED, weight='bold')
+    fig.text(.06, .87, 'ГОНКА ЗА ЛИДЕРСТВОМ',
+             fontfamily='Oswald', fontsize=36, color=INK, weight='bold')
+    fig.text(.06, .81, 'Как менялась общая сумма очков от тура к туру',
+             fontfamily='Inter', fontsize=15, color=INK)
+    fig.text(.06, .035, f"Источник: Fantasy Premier League · обновлено {spec['synced_at']} UTC",
+             fontfamily='Inter', fontsize=10, color=MUTED)
+    ax.set_xlabel('ОБЩАЯ СУММА ОЧКОВ', color=INK, fontfamily='Inter', labelpad=15)
     # bar_chart_race applies period_length to every staged interval. Distribute a
     # 15-second target across them and derive enough frames for smooth ~30 fps motion.
     period_length = math.ceil(15_100 / (len(frame) - 1))
@@ -132,14 +142,14 @@ def render_race(spec: dict) -> io.BytesIO:
             interpolate_period=False,
             label_bars=True,
             bar_size=.82,
-            period_label={"x": .98, "y": .08, "ha": "right", "va": "center", "color": red},
-            figsize=(14, 10),
+            period_label={"x": .98, "y": .08, "ha": "right", "va": "center", "color": SERIES[0]},
+            figsize=(16, 11),
             dpi=100,
-            cmap="dark24",
+            cmap=ListedColormap(SERIES),
             title=None,
-            bar_label_size=8,
-            tick_label_size=8,
-            shared_fontdict={"family": "sans-serif", "weight": "bold", "color": ink},
+            bar_label_size=10,
+            tick_label_size=10,
+            shared_fontdict={"family": "Inter", "weight": "normal", "color": INK},
             writer="ffmpeg",
             fig=fig,
             bar_kwargs={"alpha": .88},

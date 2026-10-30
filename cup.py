@@ -9,8 +9,8 @@ from datetime import datetime, timezone
 
 from telegram.error import BadRequest, Forbidden, RetryAfter
 
-from visuals import (font as cup_font, fit_text, headline, tracked_text,
-                     PAPER, INK, MUTED, QUIET, ACCENT, RULE, CARD)
+from visuals import (font as cup_font, fit_text,
+                     PAPER, INK, MUTED, QUIET, ACCENT, RULE, TINTS, chart_header)
 from data import rows
 
 
@@ -142,16 +142,16 @@ def render_cup(state, preliminary=False):
     def text(x, y, value, size=24, color=ink, bold=False, max_width=None, anchor='lt', display=False):
         value, font = fit_text(d, value, size, max_width or 1500, bold, display)
         d.text((x, y), value, font=font, fill=color, anchor=anchor)
-    d.rectangle((50, 36, width-50, 44), fill=ink)
-    tracked_text(d, (50, 65), 'ELIMAI LEAGUE / КУБОК', cup_font(20, True), accent)
-    headline(d, (50, 108), 'КУБОК МИНИ-ЛИГИ', size=90)
-    tracked_text(d, (50, 226), 'Предварительный раунд · путь в основную сетку' if preliminary else
-                 'Основная сетка · результаты сохраняются на всём пути', cup_font(22), spacing=1)
+    chart_header(d, width, 'ELIMAI / МИНИ-ЛИГА FPL / КУБОК', 'КУБОК МИНИ-ЛИГИ',
+                 'Предварительный раунд · путь в основную сетку' if preliminary else
+                 'Основная сетка · результаты сохраняются на всём пути')
     top, bottom = 350, height-160
     if preliminary:
         for i, match in enumerate(stages[0]['matches']):
             y = top + i * (bottom-top) / first_count
-            d.line((55, y-20, 1545, y-20), fill=line, width=1)
+            d.rectangle((50, y-12, 735, y+139), fill=TINTS[0])
+            d.rectangle((760, y-12, 1545, y+139), fill=TINTS[1])
+            d.line((50, y-12, 50, y+139), fill=accent, width=3)
             text(55, y, f"{match['label']} · GW{stages[0]['gw']}", 23, accent, True)
             a, b = participants(state, match)
             text(55, y+35, state['names'][str(a)], 28, muted if 'winner' in match and match['winner'] != a else ink, bold=match.get('winner') == a, max_width=480)
@@ -180,7 +180,7 @@ def render_cup(state, preliminary=False):
             for match, y in zip(stage['matches'], current):
                 w = col_w-25
                 text(x+3, y-73, f"Матч {match['label']}", 16, QUIET)
-                d.rounded_rectangle((x, y-51, x+w, y+51), radius=2, fill=CARD)
+                d.rounded_rectangle((x, y-51, x+w, y+51), radius=2, fill=TINTS[col % len(TINTS)])
                 d.line((x+16, y, x+w-16, y), fill=line, width=1)
                 ids = participants(state, match)
                 names = [slot_name(state, s) for s in match['slots']]

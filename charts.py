@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import io
 import math
-from visuals import (font as _font, headline, tracked_text, fit_text,
+from visuals import (font as _font, fit_text,
                      PAPER, INK, MUTED, RULE, ACCENT)
 
 from data import rows
@@ -72,77 +72,91 @@ def _text(draw, xy, text, font, fill, anchor=None):
 
 
 def render_chart(spec: dict) -> io.BytesIO:
-    """Render a 1600x1000 PNG. No model-generated numbers or claims are used."""
+    """Render exact stored values with the same editorial system as /graph form."""
     from PIL import Image, ImageDraw
+    from visuals import chart_header, chart_footer, SERIES, BLUE
 
-    width = 1600
-    height = max(1000, 400 + len(spec["rows"]) * 52) if spec["kind"] == "latest" else 1100
-    paper, ink, muted, grid, red = PAPER, INK, MUTED, RULE, ACCENT
-    image = Image.new("RGB", (width, height), paper)
+    latest = spec["kind"] == "latest"
+    data = spec["rows"]
+    width = 2200
+    count = len(data) if latest else len({r["entry_id"] for r in data})
+    height = max(1500, 530 + count * 48)
+    image = Image.new("RGB", (width, height), PAPER)
     draw = ImageDraw.Draw(image)
-    deck, label, small = _font(27), _font(24, True), _font(20)
-
-    draw.rectangle((70, 52, 1530, 64), fill=ink)
-    state = "LIVE / PROVISIONAL" if spec["provisional"] else "FINAL"
-    tracked_text(draw, (70, 92), f"ELIMAI LEAGUE  /  GW{spec['gw']}  /  {state}", label, red)
-
-    if spec["kind"] == "latest":
-        headline(draw, (70, 142), "Who owned the gameweek?")
-        subject = "Top 10" if spec["scope"] == "top10" else "All managers"
-        _text(draw, (70, 244), f"{subject} • whole-league median shown as the benchmark", deck, muted)
-        rows_ = spec["rows"]
-        left, top, right, bottom = 390, 318, 1490, height - 128
-        max_score = max(r["event_points"] for r in rows_)
-        axis_max = max(10, int(math.ceil(max_score / 10)) * 10)
-        median_x = left + (right - left) * spec["median"] / axis_max
-        draw.line((median_x, top - 18, median_x, bottom + 8), fill=red, width=3)
-        _text(draw, (median_x, top - 28), f"MEDIAN {spec['median']:g}", small, red, "ms")
-        row_h = (bottom - top) / len(rows_)
-        for i, row in enumerate(rows_):
-            cy = top + i * row_h + row_h / 2
-            bar_right = left + (right - left) * row["event_points"] / axis_max
-            name, face = fit_text(draw, row["entry_name"], 24 if i == 0 else 20, left - 94, bold=i == 0)
-            _text(draw, (left - 24, cy), name, face, ink, "rm")
-            draw.rectangle((left, cy - 14, bar_right, cy + 14), fill=red if i == 0 else ink)
-            _text(draw, (bar_right + 16, cy), row["event_points"], label, ink, "lm")
-        _text(draw, (70, height - 87), f"{subject} of {spec['manager_count']} managers • points after transfer costs", small, muted)
+    def text(x, y, value, size=24, color=INK, bold=False, anchor="lt"):
+        draw.text((x, y), str(value), font=_font(size, bold), fill=color, anchor=anchor)
+    state = "ПРЕДВАРИТЕЛЬНО" if spec["provisional"] else "ИТОГОВЫЕ ДАННЫЕ"
+    subject = "Топ-10" if spec["scope"] == "top10" else "Вся мини-лига"
+    chart_header(draw, width, f"ELIMAI / МИНИ-ЛИГА FPL / ТУР {spec['gw']} / {state}",
+                 "Кто выиграл этот тур?" if latest else "ГОНКА ЗА ЛИДЕРСТВОМ",
+                 f"{subject} · очки за тур и медиана всей лиги" if latest else
+                 f"{subject} · положение в общей таблице от тура к туру")
+    left, top, right, bottom = (580, 350, 2010, height-250) if latest else (165, 350, 1510, height-250)
+    if latest:
+        scores = [r["event_points"] for r in data] + [spec["median"], 0]
+        low = min(0, math.floor(min(scores)/10)*10)
+        high = max(10, math.ceil(max(scores)/10)*10)
+        x = lambda v: left + (v-low)/(high-low)*(right-left)
+        step = max(10, math.ceil((high-low)/100)*10)
+        for tick in range(low, high+1, step):
+            xx = x(tick)
+            draw.line((xx, top, xx, bottom), fill=RULE, width=1)
+            text(xx, bottom+22, tick, 22, MUTED, anchor="mt")
+        draw.line((x(0), top, x(0), bottom), fill=MUTED, width=2)
+        row_h = (bottom-top)/count
+        for i, row in enumerate(data):
+            cy = top+(i+.5)*row_h
+            name, face = fit_text(draw, row["entry_name"], 27, left-135)
+            draw.text((left-30, cy), name, font=face, fill=INK, anchor="rm")
+            value = row["event_points"]
+            a, b = sorted((x(0), x(value)))
+            draw.rectangle((a, cy-14, b, cy+14), fill=ACCENT if value >= spec["median"] else BLUE)
+            text(x(value)+(15 if value>=0 else -15), cy, value, 25, INK, True,
+                 "lm" if value>=0 else "rm")
+        mx = x(spec["median"])
+        draw.line((mx, top-12, mx, bottom), fill=ACCENT, width=3)
+        text(mx, top-33, f"МЕДИАНА {spec['median']:g}", 21, ACCENT, True, "mb")
+        note = f"{subject} · в лиге {spec['manager_count']} команд · очки после учёта штрафов за трансферы"
     else:
-        headline(draw, (70, 142), "The title race, gameweek by gameweek", size=76)
-        subject = "Current top 10" if spec["scope"] == "top10" else "Every manager"
-        _text(draw, (70, 244), f"{subject} • rank 1 is the summit", deck, muted)
-        data = spec["rows"]
-        gameweeks = sorted({r["gw_id"] for r in data})
-        by_team = {}
+        teams = {}
         for row in data:
-            by_team.setdefault((row["entry_id"], row["entry_name"]), []).append(row)
-        left, top, right, bottom = 120, 326, 1280, height - 150
-        max_rank = max(r["rank"] for r in data)
-        y_max = max(6, max_rank)
-        x = lambda gw: left if len(gameweeks) == 1 else left + (right - left) * (gw - gameweeks[0]) / (gameweeks[-1] - gameweeks[0])
-        y = lambda rank: top + (bottom - top) * (rank - 1) / max(1, y_max - 1)
-        for rank in range(1, y_max + 1):
+            teams.setdefault(row["entry_id"], []).append(row)
+        ordered = sorted(teams.values(), key=lambda rs: (rs[-1]["rank"], rs[-1]["entry_id"]))
+        weeks = sorted({r["gw_id"] for r in data})
+        max_rank = max(6, max(r["rank"] for r in data))
+        x = lambda gw: left+(right-left)*(gw-weeks[0])/max(1, weeks[-1]-weeks[0])
+        y = lambda rank: top+(bottom-top)*(rank-1)/(max_rank-1)
+        for rank in range(1, max_rank+1):
             yy = y(rank)
-            draw.line((left, yy, right, yy), fill=grid, width=1)
-            if rank == 1 or rank == y_max or rank % 5 == 0:
-                _text(draw, (left - 20, yy), rank, small, muted, "rm")
-        for gw in gameweeks:
+            draw.line((left, yy, right, yy), fill=RULE, width=1)
+            if rank == 1 or rank == max_rank or rank % 5 == 0:
+                text(left-25, yy, rank, 22, MUTED, anchor="rm")
+        for gw in weeks:
             xx = x(gw)
-            draw.line((xx, top, xx, bottom), fill=grid, width=1)
-            _text(draw, (xx, bottom + 28), f"GW{gw}", small, muted, "ma")
-        ordered = sorted(by_team.items(), key=lambda item: item[1][-1]["rank"], reverse=True)
-        for (_, name), points in ordered:
-            color = red if points[-1]["rank"] == 1 else (ink if spec["scope"] == "top10" else muted)
-            coords = [(x(p["gw_id"]), y(p["rank"])) for p in points]
-            if len(coords) > 1:
-                draw.line(coords, fill=color, width=7 if color == red else (4 if spec["scope"] == "top10" else 3), joint="curve")
+            draw.line((xx, top, xx, bottom), fill=RULE, width=1)
+            text(xx, bottom+24, gw, 22, MUTED, anchor="mt")
+        text((left+right)/2, bottom+70, "ТУР", 23, INK, True, "mt")
+        text(1580, 310, "КОМАНДЫ", 27, INK, True)
+        text(1580, 350, "По текущему месту в лиге", 21, MUTED)
+        for i, values in enumerate(ordered):
+            color = SERIES[i % len(SERIES)]
+            coords = [(x(r["gw_id"]), y(r["rank"])) for r in values]
+            if len(coords)>1:
+                draw.line(coords, fill=color, width=4, joint="curve")
             for xx, yy in coords:
-                draw.ellipse((xx - 6, yy - 6, xx + 6, yy + 6), fill=color)
-            last = points[-1]
-            name_label, face = fit_text(draw, f"{name}  #{last['rank']}", 24 if color == red else 20, 280, bold=color == red)
-            _text(draw, (right + 20, y(last["rank"])), name_label, face, color, "lm")
-        _text(draw, (70, height - 87), f"{subject} by total points • historical ranks use current league membership", small, muted)
-
-    _text(draw, (1530, height - 42), f"Source: Fantasy Premier League • synced {spec['synced_at']} UTC", small, muted, "ra")
+                draw.ellipse((xx-5, yy-5, xx+5, yy+5), fill=color)
+            # Reference numbers keep names out of the dense plotting area.
+            end_x, end_y = coords[-1]
+            offset = sum(v[-1]["rank"] == values[-1]["rank"] for v in ordered[:i])
+            label_x = end_x+23+offset*40
+            text(label_x, end_y, i+1, 20, color, True, "lm")
+            key_y = 405+i*43
+            text(1580, key_y, f"{i+1:02d}", 23, color, True)
+            name, face = fit_text(draw, f"{values[-1]['entry_name']}  ·  #{values[-1]['rank']}", 25, 480)
+            draw.text((1630, key_y), name, font=face, fill=INK, anchor="lt")
+        note = "Выше — лучше · исторические места восстановлены по текущему составу мини-лиги"
+    chart_footer(draw, width, height, note,
+                 f"Источник: Fantasy Premier League · обновлено {spec['synced_at']} UTC")
     output = io.BytesIO()
     output.name = f"elimai-league-{spec['kind']}-{spec['scope']}-gw{spec['gw']}.png"
     image.save(output, "PNG", optimize=True)

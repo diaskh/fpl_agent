@@ -14,6 +14,7 @@ from telegram.error import Forbidden, TimedOut
 
 from bot import Config, Service, graph_command, race_command, report_command
 from charts import chart_spec
+from form import form_spec, render_form
 from race import race_spec
 from data import FPL, Store, calculate, due_fixture_groups, connect, historical_ranks, latest_completed, month_phase, rows
 from formatting import blocks, escaped, format_messages, render
@@ -338,6 +339,48 @@ class DataTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.reply_photo.await_count, 1)
         self.assertEqual(renderer.call_args.args[0], [163, 162])
         self.assertIn("общей таблицы", message.reply_photo.call_args.kwargs["caption"])
+
+    async def test_form_uses_stored_scores_and_same_cohort_means(self):
+        await self.store.ensure_through(3, self.bootstrap)
+        await self.db.execute("UPDATE standings SET total_points=200,event_points=30 WHERE entry_id=1 AND gw_id=3")
+        await self.db.execute("UPDATE standings SET total_points=100,event_points=10 WHERE entry_id=2 AND gw_id=3")
+        await self.db.execute("INSERT OR REPLACE INTO result_status VALUES (2,1)")
+        await self.db.commit()
+        spec = await form_spec(self.db, 3)
+        self.assertEqual(spec["season_mean"], 150)
+        self.assertEqual([t["recent"] for t in spec["rows"]], [110, 100])
+        self.assertEqual(spec["recent_mean"], 105)
+        self.assertTrue(spec["provisional"])
+        from PIL import Image
+        photo = render_form(spec)
+        self.assertEqual(photo.name, "elimai-league-form-gw3.png")
+        self.assertEqual(Image.open(photo).size, (2200, 1640))
+        await self.db.execute("DELETE FROM standings WHERE entry_id=2 AND gw_id=2")
+        with self.assertRaisesRegex(ValueError, "Incomplete"):
+            await form_spec(self.db, 3)
+
+    async def test_form_requires_three_synced_gameweeks(self):
+        await self.seed()
+        with self.assertRaisesRegex(ValueError, "three gameweeks"):
+            await form_spec(self.db, 2)
+        with self.assertRaisesRegex(ValueError, "not synced"):
+            await form_spec(self.db, 4)
+
+    async def test_graph_form_refreshes_database_and_sends_one_image(self):
+        service = Service(Config("", -100, 1, 836115, "", ""), self.db, self.fpl, None)
+        message = SimpleNamespace(reply_text=AsyncMock(), reply_photo=AsyncMock())
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=2, is_bot=False),
+                                 effective_chat=SimpleNamespace(id=-100), effective_message=message)
+        context = SimpleNamespace(application=SimpleNamespace(bot_data={"service": service}), args=["form"])
+        with patch("bot.render_form", return_value=SimpleNamespace(name="form.png")) as renderer:
+            await graph_command(update, context)
+        message.reply_text.assert_not_awaited()
+        message.reply_photo.assert_awaited_once()
+        spec = renderer.call_args.args[0]
+        self.assertEqual(spec["gw"], 3)
+        self.assertEqual(len(spec["rows"]), 2)
+        self.assertIn("Сила сезона", message.reply_photo.call_args.kwargs["caption"])
+        self.assertEqual(len(await rows(self.db, "SELECT * FROM sync_runs")), 3)
 
     async def test_chart_spec_supports_top_ten_and_all_scopes(self):
         await self.store.ensure_through(3, self.bootstrap)
